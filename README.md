@@ -9,7 +9,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/nyx-sec/nyx/ci.yml?branch=master)](https://github.com/nyx-sec/nyx/actions)
 [![Docs](https://img.shields.io/badge/docs-nyxscan.dev%2Fdocs-blue)](https://nyxscan.dev/docs/)
 
-English · [简体中文](./README.zh-CN.md)
+English · (./README.zh-CN.md)
 </div>
 
 <p align="center"><img src="assets/screenshots/demo.gif" alt="Nyx UI walkthrough: empty Welcome state, kicking off a scan, the populated overview with Health Score, drilling into a HIGH finding's flow visualizer, then the triage flow" width="900"/></p>
