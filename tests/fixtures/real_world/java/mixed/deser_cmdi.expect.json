@@ -1,0 +1,69 @@
+{
+  "description": "Deserialized object from HTTP input stream used directly as command argument to Runtime.exec",
+  "tags": [
+    "taint",
+    "deser",
+    "cmdi",
+    "servlet",
+    "mixed"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "java.deser.readobject",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        5,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "AST pattern detects new ObjectInputStream() construction"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        5,
+        11
+      ],
+      "evidence_contains": [],
+      "notes": "Deserialized command string from request input flows into Runtime.exec"
+    },
+    {
+      "rule_id": "java.cmdi.runtime_exec",
+      "severity": "HIGH",
+      "must_match": true,
+      "line_range": [
+        9,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "Runtime.getRuntime().exec(command) with deserialized input; AST pattern correctly matches"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "MEDIUM",
+      "must_not_match": true,
+      "line_range": [
+        11,
+        11
+      ],
+      "notes": "response.getWriter().println(\"Done\") — constant string, must NOT raise reflected-XSS (Cap::HTML_ESCAPE). Regression guard retargeted from the retired java.xss.getwriter_print AST pattern to the taint sink that now owns reflected XSS."
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "MEDIUM",
+      "must_match": true,
+      "line_range": [
+        8,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "readObject() result cast to String flows directly to Runtime.exec \u2014 additional taint path for deserialized command"
+    }
+  ]
+}

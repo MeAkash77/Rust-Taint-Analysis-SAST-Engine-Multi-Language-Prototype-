@@ -1,0 +1,36 @@
+{
+  "description": "Context manager vs manual open - else branch leaks file handle",
+  "tags": [
+    "state",
+    "resource-leak",
+    "context-manager",
+    "file-io"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "state-resource-leak",
+      "severity": null,
+      "must_match": false,
+      "line_range": [
+        12,
+        19
+      ],
+      "evidence_contains": [],
+      "notes": "else branch opens file manually and never closes it"
+    },
+    {
+      "rule_id": "cfg-resource-leak",
+      "severity": "MEDIUM",
+      "must_match": true,
+      "line_range": [
+        15,
+        15
+      ],
+      "evidence_contains": [],
+      "notes": "open() in else branch without with statement \u2014 f never closed, real resource leak"
+    }
+  ]
+}

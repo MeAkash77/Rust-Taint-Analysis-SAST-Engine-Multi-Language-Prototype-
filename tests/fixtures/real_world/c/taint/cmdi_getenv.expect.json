@@ -1,0 +1,71 @@
+{
+  "description": "getenv flows directly to system() call — classic command injection. Safe version uses allowlist comparison.",
+  "tags": [
+    "taint",
+    "cmdi"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "c.cmdi.system",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        5,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "AST pattern detects system() call"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        4,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "getenv(\"USER_CMD\") flows directly into system(cmd) without sanitization"
+    },
+    {
+      "rule_id": "c.cmdi.system",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        12,
+        16
+      ],
+      "evidence_contains": [],
+      "notes": "AST pattern still fires on system() in safe version — pattern is syntactic"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "max_count": 1,
+      "line_range": [
+        14,
+        14
+      ],
+      "evidence_contains": [],
+      "notes": "TP: getenv at line 11 flows to system(cmd) at line 14 in run_safe — scanner does not model strcmp as a validator, so the allowlist check does not sanitize. Exactly one finding after dedup."
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": false,
+      "line_range": [
+        9,
+        16
+      ],
+      "evidence_contains": [],
+      "notes": "Safe version with strcmp allowlist — ideally suppressed but scanner may not model strcmp as validation"
+    }
+  ]
+}

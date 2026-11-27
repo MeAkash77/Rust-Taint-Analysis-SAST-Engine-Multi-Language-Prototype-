@@ -1,0 +1,48 @@
+{
+  "description": "SQL injection via fmt.Sprintf query construction; safe version uses parameterized query",
+  "tags": [
+    "taint",
+    "sqli"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "HIGH",
+      "must_match": true,
+      "line_range": [
+        14,
+        14
+      ],
+      "evidence_contains": [],
+      "notes": "TP: r.URL.Query().Get(\"id\") (source line 12) flows through fmt.Sprintf query into db.Query — SQL injection at the precise sink"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": false,
+      "line_range": [
+        22,
+        27
+      ],
+      "evidence_contains": [],
+      "notes": "getUserSafe uses parameterized query — should NOT produce a taint finding"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_not_match": true,
+      "line_range": [
+        25,
+        25
+      ],
+      "evidence_contains": [],
+      "notes": "getUserSafe at line 25 uses parameterized query ($1) — scanner correctly identifies safe binding, no taint finding. Regression guard."
+    }
+  ]
+}

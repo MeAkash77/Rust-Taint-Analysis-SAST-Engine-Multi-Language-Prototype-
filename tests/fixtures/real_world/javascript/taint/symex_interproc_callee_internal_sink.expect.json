@@ -1,0 +1,50 @@
+{
+  "description": "Callee contains internal SQL sink (db.query inside processAndStore). Tests callee-internal sink detection during interprocedural execution.",
+  "tags": [
+    "taint",
+    "sqli",
+    "symex",
+    "interproc"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        11,
+        11
+      ],
+      "evidence_contains": [],
+      "notes": "outer call site: req.query.msg → processAndStore where summary param_to_sink resolves the SQL_QUERY cap via outer_callee fallback (CVE-2025-64430-style detection)"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_not_match": true,
+      "line_range": [
+        4,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "no second copy of the line-11 flow sourced at the `input` param: processAndStore has a caller in the file, so the name-based handler-param seed does not apply and the SQL flow is reported once, at the call site"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        12,
+        12
+      ],
+      "evidence_contains": [],
+      "notes": "return-value flow: processAndStore returns input.length, count carries taint to res.send (HTML_ESCAPE sink)"
+    }
+  ]
+}

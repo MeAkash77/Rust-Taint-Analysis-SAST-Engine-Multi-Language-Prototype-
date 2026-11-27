@@ -1,0 +1,36 @@
+{
+  "description": "cURL handle resource leak - missing curl_close vs properly closed",
+  "tags": [
+    "cfg",
+    "resource-leak",
+    "curl",
+    "php"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "cfg-resource-leak",
+      "severity": null,
+      "must_match": false,
+      "line_range": [
+        1,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "fetchUrl opens cURL handle but never calls curl_close"
+    },
+    {
+      "rule_id": "state-resource-leak",
+      "severity": "MEDIUM",
+      "must_match": true,
+      "line_range": [
+        3,
+        3
+      ],
+      "evidence_contains": [],
+      "notes": "TP: curl_init at line 3 in fetchUrl is never closed; curl_close is missing from this function, so the cURL handle leaks"
+    }
+  ]
+}

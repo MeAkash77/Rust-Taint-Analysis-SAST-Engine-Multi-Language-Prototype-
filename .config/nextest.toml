@@ -1,0 +1,38 @@
+# nextest configuration
+#
+# See https://nexte.st/docs/configuration/ for the full schema.
+
+# ── Test groups ──────────────────────────────────────────────────────────────
+#
+# `hostile-input-timing` serialises the two timing-bounded
+# `hostile_input_tests` cases that pass under nextest in isolation but fail
+# under the full-suite parallel run on darwin (resource contention from the
+# other ~4000 tests pushes them past their internal budget). Pinning them to
+# a single thread within their own group keeps their wall-clock predictable
+# without slowing the rest of the suite.
+
+# Dynamic-verification e2e cases (`e2e_phase_*`) run a real language runtime
+# inside a sandbox under a wall-clock deadline. Serialising them into their own
+# group was tried first and was not enough: capping that group still leaves
+# several thousand other cases saturating the cores, and the deadline is
+# wall-clock, so a harness can burn its whole budget waiting to be scheduled.
+# The budget itself is raised for test runs instead, via the [env] section
+# below, which leaves the product default at 5s.
+
+[test-groups]
+hostile-input-timing = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(hostile_input_tests) and (test(very_long_single_line_parses) or test(many_small_functions_do_not_explode))'
+test-group = 'hostile-input-timing'
+
+# ── Environment ──────────────────────────────────────────────────────────────
+#
+# Raise the sandbox wall-clock deadline for test runs only. `SandboxOptions`
+# defaults to 5s, which is right for a real `nyx scan --verify` but too tight
+# when the full suite is competing for cores: `e2e_phase_*` cases were failing
+# intermittently with `timed_out: true` and an empty stdout, which reads as a
+# verification miss rather than as scheduling starvation. Read by
+# `dynamic::sandbox::default_sandbox_timeout`.
+[env]
+NYX_SANDBOX_TIMEOUT_SECS = "20"

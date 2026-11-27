@@ -1,0 +1,182 @@
+import { useMutation, useQueryClient } from '@tanstack/react-query';
+import { apiPost, apiPut, apiDelete } from '../client';
+import type { LabelEntryView, TerminatorView, ProfileView } from '../types';
+
+// --- Sources ---
+
+export interface AddLabelBody {
+  lang: string;
+  matchers: string[];
+  cap: string;
+  case_sensitive?: boolean;
+}
+
+export function useAddSource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddLabelBody) =>
+      apiPost<LabelEntryView>('/config/sources', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'sources'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+export function useDeleteSource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddLabelBody) =>
+      apiDelete<void>('/config/sources', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'sources'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+// --- Sinks ---
+
+export function useAddSink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddLabelBody) =>
+      apiPost<LabelEntryView>('/config/sinks', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'sinks'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+export function useDeleteSink() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddLabelBody) => apiDelete<void>('/config/sinks', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'sinks'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+// --- Sanitizers ---
+
+export function useAddSanitizer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddLabelBody) =>
+      apiPost<LabelEntryView>('/config/sanitizers', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'sanitizers'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+export function useDeleteSanitizer() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddLabelBody) =>
+      apiDelete<void>('/config/sanitizers', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'sanitizers'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+// --- Terminators ---
+
+export interface AddTerminatorBody {
+  lang: string;
+  name: string;
+}
+
+export function useAddTerminator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddTerminatorBody) =>
+      apiPost<TerminatorView>('/config/terminators', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'terminators'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+export function useDeleteTerminator() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: AddTerminatorBody) =>
+      apiDelete<void>('/config/terminators', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'terminators'] });
+      qc.invalidateQueries({ queryKey: ['rules'] });
+    },
+  });
+}
+
+// --- Profiles ---
+
+export function useAddProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { name: string; settings: Record<string, unknown> }) =>
+      apiPost<ProfileView>('/config/profiles', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'profiles'] });
+    },
+  });
+}
+
+export function useDeleteProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiDelete<void>(`/config/profiles/${encodeURIComponent(name)}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config', 'profiles'] });
+    },
+  });
+}
+
+export function useActivateProfile() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiPost<void>(`/config/profiles/${encodeURIComponent(name)}/activate`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config'] });
+      qc.invalidateQueries({ queryKey: ['config', 'profiles'] });
+    },
+  });
+}
+
+// --- Raw nyx.local TOML ---
+
+export function useSaveRawConfig() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (content: string) =>
+      apiPut<{ status: string; path: string; bytes: number }>('/config/raw', {
+        content,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['config'] });
+    },
+  });
+}
+
+// --- Triage Sync ---
+
+export function useToggleTriageSync() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { enabled: boolean }) =>
+      apiPost<void>('/config/triage-sync', body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['triage', 'sync-status'] });
+    },
+  });
+}

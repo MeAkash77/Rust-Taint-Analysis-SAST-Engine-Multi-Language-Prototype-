@@ -1,0 +1,46 @@
+{
+  "description": "Command execution inside closure passed as higher-order function argument",
+  "tags": [
+    "cmdi",
+    "cfg",
+    "closure"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "rs.quality.unwrap",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        3,
+        7
+      ],
+      "evidence_contains": [],
+      "notes": ".unwrap() on env::var Result in apply_command"
+    },
+    {
+      "rule_id": "rs.quality.unwrap",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        9,
+        13
+      ],
+      "evidence_contains": [],
+      "notes": ".unwrap() on Command output Result in closure"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "HIGH",
+      "must_match": true,
+      "line_range": [
+        10,
+        11
+      ],
+      "evidence_contains": [],
+      "notes": "TP: env::var(\"CMD\") at line 5 flows through closure parameter into Command::new at line 11 \u2014 command injection via higher-order function; primary location now points at line 11 (callee-internal sink)"
+    }
+  ]
+}

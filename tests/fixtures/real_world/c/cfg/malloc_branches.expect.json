@@ -1,0 +1,68 @@
+{
+  "description": "malloc leak on early return: process_data returns without free when strlen > 100",
+  "tags": [
+    "cfg",
+    "resource-leak"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "c.memory.strcpy",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        5,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "strcpy in duplicate_string \u2014 AST pattern match"
+    },
+    {
+      "rule_id": "c.memory.strcpy",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        12,
+        16
+      ],
+      "evidence_contains": [],
+      "notes": "strcpy in process_data \u2014 AST pattern match"
+    },
+    {
+      "rule_id": "cfg-resource-leak",
+      "severity": null,
+      "must_match": false,
+      "line_range": [
+        15,
+        19
+      ],
+      "evidence_contains": [],
+      "notes": "malloc at line 12 not freed before return at line 17 \u2014 aspirational CFG finding"
+    },
+    {
+      "rule_id": "resource-leak",
+      "severity": null,
+      "must_match": false,
+      "must_not_match": true,
+      "line_range": [
+        4,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "No leak in duplicate_string: buf is NULL on the `buf == NULL` early return, so nothing was allocated on that path, and the success path returns buf to the caller. Previously expected state-resource-leak-possible here, which was the FP."
+    },
+    {
+      "rule_id": "state-resource-leak-possible",
+      "severity": "LOW",
+      "must_match": true,
+      "line_range": [
+        11,
+        14
+      ],
+      "evidence_contains": [],
+      "notes": "malloc at line 12 leaks if early return at line 17 (strlen > 100 branch)."
+    }
+  ]
+}

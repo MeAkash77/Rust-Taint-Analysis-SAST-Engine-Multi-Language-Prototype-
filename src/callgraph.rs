@@ -1,0 +1,3819 @@
+//! Whole-program call graph built from pass-1 function summaries.
+//!
+//! Nodes are [`FuncKey`]s (one per function definition across all files).
+//! Edges represent call-site relationships resolved after pass 1 completes.
+//! Unresolved and ambiguous callees are tracked separately so they can be
+//! surfaced in diagnostics without blocking analysis.
+//!
+//! [`CallGraphAnalysis`] computes SCCs and topological order. The scanner
+//! uses topo order in pass 2 so callees are analysed before their callers,
+//! and iterates over SCC groups to a fixed point for mutually recursive
+//! functions.
+
+use crate::interop::InteropEdge;
+use crate::rust_resolve::RustUseMap;
+use crate::summary::{
+    CallReceiver, CalleeQuery, CalleeResolution, GlobalSummaries, classify_call_receiver,
+};
+use crate::symbol::{FuncKey, Lang};
+use petgraph::graph::NodeIndex;
+use petgraph::prelude::*;
+use smallvec::SmallVec;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+//  Types
+
+/// Metadata attached to each call-graph edge.
+#[derive(Debug, Clone)]
+pub struct CallEdge {
+    /// The raw callee string as it appeared in source (e.g. `"env::var"`).
+    /// Preserved for diagnostics, **not** the normalized form used for resolution.
+    pub call_site: String,
+}
+
+/// A callee that could not be resolved to any known function definition.
+#[derive(Debug, Clone)]
+pub struct UnresolvedCallee {
+    pub caller: FuncKey,
+    pub callee_name: String,
+}
+
+/// A callee that matched multiple function definitions, ambiguous.
+#[derive(Debug, Clone)]
+pub struct AmbiguousCallee {
+    pub caller: FuncKey,
+    pub callee_name: String,
+    pub candidates: Vec<FuncKey>,
+}
+
+/// The whole-program call graph.
+///
+/// Nodes are [`FuncKey`]s (one per function definition across all files).
+/// Edges represent call-site relationships resolved after pass 1.
+#[derive(Debug)]
+pub struct CallGraph {
+    pub graph: DiGraph<FuncKey, CallEdge>,
+    /// `FuncKey → NodeIndex` for quick lookup.
+    pub index: HashMap<FuncKey, NodeIndex>,
+    /// Callee strings that could not be resolved to any [`FuncKey`].
+    pub unresolved_not_found: Vec<UnresolvedCallee>,
+    /// Callee strings that matched multiple candidates.
+    pub unresolved_ambiguous: Vec<AmbiguousCallee>,
+}
+
+/// Result of SCC / topological analysis on the call graph.
+pub struct CallGraphAnalysis {
+    /// Strongly connected components.
+    pub sccs: Vec<Vec<NodeIndex>>,
+    /// Maps each `NodeIndex` to its SCC index in `sccs`.
+    #[allow(dead_code)] // used for future topo-ordered taint propagation
+    pub node_to_scc: HashMap<NodeIndex, usize>,
+    /// SCC indices in **callee-first** (leaves-first) order.
+    ///
+    /// Functions with no callees appear first; callers appear later.
+    /// Suitable for bottom-up taint propagation.
+    pub topo_scc_callee_first: Vec<usize>,
+}
+
+//  Callee-name normalization
+
+/// Drop a trailing Rust turbofish (`run_it::<u8>` becomes `run_it`).
+///
+/// The CFG keeps the generic arguments in the callee text, and the `::` split
+/// that finds the leaf would otherwise return `<u8>` (or `String>` for
+/// `run_it::<std::string::String>`), so a generic user function never resolved
+/// to its summary.  Walks back over the balanced `<..>` group, skipping the `>`
+/// of a `->` inside it, and only trims when `::` sits right before the `<`.
+pub(crate) fn trim_trailing_turbofish(raw: &str) -> &str {
+    if !raw.ends_with('>') {
+        return raw;
+    }
+    let bytes = raw.as_bytes();
+    let mut depth = 0u32;
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        match bytes[i] {
+            b'>' if i == 0 || bytes[i - 1] != b'-' => depth += 1,
+            b'<' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return if i >= 2 && bytes[i - 2] == b':' && bytes[i - 1] == b':' {
+                        &raw[..i - 2]
+                    } else {
+                        raw
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    raw
+}
+
+/// Extract the last segment of a qualified callee name for resolution.
+///
+/// ```text
+/// "env::var"              → "var"
+/// "std::process::Command" → "Command"
+/// "obj.method"            → "method"
+/// "pkg.mod.func"          → "func"
+/// "foo"                   → "foo"  (unchanged)
+/// ""                      → ""     (edge case)
+/// ```
+///
+/// The original raw text is preserved on [`CallEdge::call_site`] for
+/// diagnostics; this function only produces the lookup key.
+/// Preserve the last **two** segments for better disambiguation.
+///
+/// ```text
+/// "std::env::var"      → "env::var"
+/// "env::var"           → "env::var"
+/// "pkg.mod.func"       → "mod.func"
+/// "http_client.send"   → "http_client.send"
+/// "send"               → "send"
+/// ""                   → ""
+/// ```
+pub(crate) fn normalize_callee_name(raw: &str) -> &str {
+    let raw = trim_trailing_turbofish(raw);
+    // Try "::" separators first (Rust / C++ qualification)
+    if let Some(pos) = raw.rfind("::") {
+        let before_last = &raw[..pos];
+        if let Some(pos2) = before_last.rfind("::") {
+            // ≥3 segments → keep last two: "std::env::var" → "env::var"
+            return &raw[pos2 + 2..];
+        }
+        // ≤2 segments → keep all: "env::var" → "env::var"
+        return raw;
+    }
+
+    // Try "." separators (method calls, Python/JS dotted paths)
+    if let Some(pos) = raw.rfind('.') {
+        let before_last = &raw[..pos];
+        if let Some(pos2) = before_last.rfind('.') {
+            // ≥3 segments → keep last two: "pkg.mod.func" → "mod.func"
+            return &raw[pos2 + 1..];
+        }
+        // ≤2 segments → keep all: "http_client.send" → "http_client.send"
+        return raw;
+    }
+
+    // No separators → return as-is
+    raw
+}
+
+/// Extract the final (leaf) segment after `::` or `.` separators.
+///
+/// This is the original single-segment normalization, used for direct
+/// map lookups where keys are stored as bare function names.
+///
+/// ```text
+/// "std::env::var" → "var"
+/// "obj.method"    → "method"
+/// "foo"           → "foo"
+/// ```
+pub(crate) fn callee_leaf_name(raw: &str) -> &str {
+    let raw = trim_trailing_turbofish(raw);
+    let after_colons = raw.rsplit("::").next().unwrap_or(raw);
+    after_colons.rsplit('.').next().unwrap_or(after_colons)
+}
+
+/// Extract the segment *immediately before* the leaf as a container hint.
+///
+/// For `"OrderService::process"` this yields `"OrderService"`; for
+/// `"obj.method"`, `"obj"`.  When the raw name is unqualified (`"send"`) the
+/// hint is empty.  The intent is to give [`resolve_callee_key_with_container`]
+/// enough context to pick the right method when two classes in the same file
+/// define the same leaf name.
+pub(crate) fn callee_container_hint(raw: &str) -> &str {
+    let raw = trim_trailing_turbofish(raw);
+    if let Some(pos) = raw.rfind("::") {
+        let prefix = &raw[..pos];
+        return prefix.rsplit("::").next().unwrap_or(prefix);
+    }
+    if let Some(pos) = raw.rfind('.') {
+        let prefix = &raw[..pos];
+        return prefix.rsplit('.').next().unwrap_or(prefix);
+    }
+    ""
+}
+
+/// Whether the call `raw_callee` made inside `caller` may be `caller`
+/// calling itself.
+///
+/// Name-based resolution matches on the leaf name, so a call that only
+/// shares the caller's name (`repo.find(id)` inside `find`,
+/// `super.init(cfg)` inside `init`, `parent::events()` inside `events`,
+/// `json.dumps(o)` inside `dumps`) would otherwise become a self edge and
+/// mark the caller recursive.  Only a bare call or a call on the caller's
+/// own instance or class can be self-recursion.  A receiver chain
+/// (`this.repo`, `$this->inner`, `h.mux`) is a field of some object and
+/// never the caller's own instance.
+pub(crate) fn site_may_call_self(caller: &FuncKey, raw_callee: &str) -> bool {
+    let prefix = if let Some(pos) = raw_callee.rfind("::") {
+        &raw_callee[..pos]
+    } else if let Some(pos) = raw_callee.rfind('.') {
+        &raw_callee[..pos]
+    } else {
+        return true;
+    };
+    if prefix.contains('.') || prefix.contains("->") || prefix.contains("::") {
+        return false;
+    }
+    let container = Some(caller.container.as_str()).filter(|c| !c.is_empty());
+    classify_call_receiver(caller.lang, Some(prefix), container) == CallReceiver::Own
+}
+
+/// Strip the optional `"<pkg>::"` package prefix from a call-graph
+/// namespace, yielding the plain project-relative path.
+///
+/// `crate::symbol::namespace_with_package` produces package-qualified
+/// namespaces of the form `format!("{pkg}::{rel}")` for any file that
+/// lives inside a resolved [`crate::resolve::PackageEntry`] (e.g. any
+/// repo with a named `package.json`). The package name never contains
+/// `::` and project-relative file paths never contain `::`, so the
+/// **first** `::` is unambiguously the package separator and everything
+/// after it is the plain `normalize_namespace` form.
+///
+/// Used to align two keying conventions that would otherwise never
+/// match: call-graph [`FuncKey::namespace`]s (package-qualified) versus
+/// file paths normalised via plain `normalize_namespace`. Returns the
+/// input unchanged when no `::` is present.
+pub(crate) fn strip_package_prefix(ns: &str) -> &str {
+    match ns.split_once("::") {
+        Some((_pkg, rel)) => rel,
+        None => ns,
+    }
+}
+
+//  Class / container → method index
+
+/// Per-language `(container, method_name)` → candidate [`FuncKey`] index.
+///
+/// Built once per call-graph construction over every merged
+/// [`crate::summary::FuncSummary`].  Used by edge insertion to restrict an indirect method
+/// call (`receiver.method(...)`) to only those targets whose defining
+/// container matches the receiver's static type.  Without a container
+/// hint the index falls back to the bare-name list, matching today's
+/// name-only resolution byte-for-byte.
+///
+/// Key design notes:
+///
+/// * Keys are **language-scoped**, a Java `findById` and a Python
+///   `findById` never alias.  Every other index in this module is also
+///   language-scoped (`by_lang_name`, `by_lang_qualified`); keeping the
+///   same partition here means devirtualisation's "subset of today's
+///   targets" invariant is structurally preserved.
+/// * The container key carries the [`FuncKey::container`] verbatim
+///   (e.g. `"Repository"` or nested `"Outer::Inner"`).  Empty containers
+///   are not indexed in `by_container`, free top-level functions live
+///   only in `by_name` and are looked up via the `None` container path.
+/// * `SmallVec` inline capacity is sized for the common case (≤ 2 same-
+///   container overloads, ≤ 4 same-name candidates across containers);
+///   spillover allocates but keeps lookups O(1) amortised.
+#[derive(Debug, Default, Clone)]
+pub struct ClassMethodIndex {
+    /// `(lang, container, method_name)` → all candidate `FuncKey`s
+    /// whose defining container matches.  Empty containers are not
+    /// indexed here; use the `None` arm of [`Self::resolve`] for those.
+    by_container: HashMap<(Lang, String, String), SmallVec<[FuncKey; 2]>>,
+    /// `(lang, method_name)` → every `FuncKey` with that leaf name in
+    /// the language, regardless of container.  This is the fallback
+    /// path for calls with no resolvable receiver type and matches
+    /// today's name-only edge insertion.
+    by_name: HashMap<(Lang, String), SmallVec<[FuncKey; 4]>>,
+}
+
+impl ClassMethodIndex {
+    /// Build the index from a [`GlobalSummaries`] map.
+    ///
+    /// Iteration is over every `FuncKey` in the map; each key is
+    /// inserted into `by_name` and (when its container is non-empty)
+    /// into `by_container`.  No ordering guarantees on the candidate
+    /// vectors, call sites that need determinism should sort downstream.
+    pub fn build(summaries: &GlobalSummaries) -> Self {
+        let mut by_container: HashMap<(Lang, String, String), SmallVec<[FuncKey; 2]>> =
+            HashMap::new();
+        let mut by_name: HashMap<(Lang, String), SmallVec<[FuncKey; 4]>> = HashMap::new();
+
+        for (key, _) in summaries.iter() {
+            let name_key = (key.lang, key.name.clone());
+            by_name.entry(name_key).or_default().push(key.clone());
+
+            if !key.container.is_empty() {
+                let cont_key = (key.lang, key.container.clone(), key.name.clone());
+                by_container.entry(cont_key).or_default().push(key.clone());
+            }
+        }
+
+        ClassMethodIndex {
+            by_container,
+            by_name,
+        }
+    }
+
+    /// Resolve `(container, method)` to its candidate target set.
+    ///
+    /// * `container = Some(c)`, return only candidates whose defining
+    ///   container equals `c`.  Empty slice when no such target exists,
+    ///   even if a same-name function lives in another container.
+    ///   This is the **devirtualised** path: a hard subset of `by_name`.
+    /// * `container = None`, return every same-name candidate in the
+    ///   language.  This is the **fallback** path used when the receiver
+    ///   type is unknown; matches today's name-only behaviour.
+    ///
+    /// The returned slice is borrowed from the index; lifetime ties to
+    /// `&self`.  Callers may need to clone keys before mutating the
+    /// owning graph.
+    pub fn resolve(&self, lang: Lang, container: Option<&str>, method: &str) -> &[FuncKey] {
+        match container {
+            Some(c) if !c.is_empty() => self
+                .by_container
+                .get(&(lang, c.to_string(), method.to_string()))
+                .map(|v| v.as_slice())
+                .unwrap_or_default(),
+            _ => self
+                .by_name
+                .get(&(lang, method.to_string()))
+                .map(|v| v.as_slice())
+                .unwrap_or_default(),
+        }
+    }
+}
+
+// ── Type hierarchy index ────────────────────────────────────────────────
+
+/// Per-language `(super_type) → sub-types` index built from every merged
+/// [`crate::summary::FuncSummary::hierarchy_edges`]. Lets virtual
+/// dispatch fan out to every concrete implementer's matching method.
+///
+/// Covers Java `extends`/`implements`, Rust `impl Trait for Type`, TS
+/// `extends`/`implements`, Python `class X(Base)`, plus PHP/Ruby/C++
+/// (see `crate::cfg::hierarchy`). Go's structural interfaces are
+/// intentionally omitted, name-only resolution is used instead.
+///
+/// Container names are bare (no namespace), so cross-namespace aliases
+/// may over-fan-out. That is conservative for correctness.
+#[derive(Debug, Default, Clone)]
+pub struct TypeHierarchyIndex {
+    /// `(lang, super_type)` → distinct sub-type / impl container names.
+    by_super: HashMap<(Lang, String), SmallVec<[String; 4]>>,
+    /// `(lang, sub_type)` → distinct direct super-type names, in the order
+    /// the declarations list them.  Resolves `super.m()` / `parent::m()`.
+    by_sub: HashMap<(Lang, String), SmallVec<[String; 2]>>,
+}
+
+impl TypeHierarchyIndex {
+    /// Build the index from every merged
+    /// [`crate::summary::FuncSummary::hierarchy_edges`] vector.  Each
+    /// `(sub, super)` pair is inserted once per language; duplicates
+    /// across files (the same edge written into every per-file
+    /// summary) collapse via the membership check.
+    pub fn build(summaries: &GlobalSummaries) -> Self {
+        let mut by_super: HashMap<(Lang, String), SmallVec<[String; 4]>> = HashMap::new();
+        let mut by_sub: HashMap<(Lang, String), SmallVec<[String; 2]>> = HashMap::new();
+
+        for (key, summary) in summaries.iter() {
+            let lang = key.lang;
+            for (sub, sup) in &summary.hierarchy_edges {
+                if sub.is_empty() || sup.is_empty() {
+                    continue;
+                }
+                let subs = by_super.entry((lang, sup.clone())).or_default();
+                if !subs.iter().any(|s| s == sub) {
+                    subs.push(sub.clone());
+                }
+                let sups = by_sub.entry((lang, sub.clone())).or_default();
+                if !sups.iter().any(|s| s == sup) {
+                    sups.push(sup.clone());
+                }
+            }
+        }
+
+        TypeHierarchyIndex { by_super, by_sub }
+    }
+
+    /// Return the distinct direct super-type names of `sub_type`.  Empty
+    /// when none were recorded.
+    pub fn supers_of(&self, lang: Lang, sub_type: &str) -> &[String] {
+        self.by_sub
+            .get(&(lang, sub_type.to_string()))
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Return the distinct sub-type / impl container names for
+    /// `super_type`.  Empty slice when the type has no recorded
+    /// subs (i.e. either it's a leaf type or no matching
+    /// hierarchy edges were extracted).
+    pub fn subs_of(&self, lang: Lang, super_type: &str) -> &[String] {
+        self.by_super
+            .get(&(lang, super_type.to_string()))
+            .map(|v| v.as_slice())
+            .unwrap_or_default()
+    }
+
+    /// Number of distinct `(lang, super_type)` keys.  Exposed for
+    /// diagnostics / tests.
+    #[allow(dead_code)]
+    pub fn super_keys_len(&self) -> usize {
+        self.by_super.len()
+    }
+
+    /// Resolve `(container, method)` widened by hierarchy lookup,
+    /// returning every concrete-implementer FuncKey whose container
+    /// is `container` itself OR a known sub-type of `container`.
+    ///
+    /// Behaviour:
+    /// * `container = None` → falls through to
+    ///   [`ClassMethodIndex::resolve`]'s name-only path; the
+    ///   hierarchy lookup is a no-op.
+    /// * `container = Some(c)` and `c` has no recorded sub-types →
+    ///   identical to `ClassMethodIndex::resolve(_, Some(c), _)`.
+    /// * `container = Some(c)` with sub-types `s1, s2, …` → union of
+    ///   `resolve(_, Some(c), m)` ∪ `resolve(_, Some(s1), m)` ∪
+    ///   `resolve(_, Some(s2), m)` ∪ ….  Dedup is applied.
+    ///
+    /// The returned `Vec` is a fresh allocation since the union is
+    /// computed across multiple borrowed slices in the underlying
+    /// [`ClassMethodIndex`] and cannot share storage with any of them.
+    /// Cost: O(k · m) where k = number of sub-types and m = average
+    /// candidates per `(container, method)` lookup; in practice k is
+    /// in the single digits.
+    pub fn resolve_with_hierarchy(
+        &self,
+        method_index: &ClassMethodIndex,
+        lang: Lang,
+        container: Option<&str>,
+        method: &str,
+    ) -> Vec<FuncKey> {
+        let Some(c) = container.filter(|s| !s.is_empty()) else {
+            return method_index.resolve(lang, None, method).to_vec();
+        };
+        let mut out: Vec<FuncKey> = Vec::new();
+        let push_unique = |dst: &mut Vec<FuncKey>, src: &[FuncKey]| {
+            for k in src {
+                if !dst.iter().any(|e| e == k) {
+                    dst.push(k.clone());
+                }
+            }
+        };
+        // Direct container match first.
+        push_unique(&mut out, method_index.resolve(lang, Some(c), method));
+        // Each known sub-type of `c`.
+        for sub in self.subs_of(lang, c) {
+            push_unique(
+                &mut out,
+                method_index.resolve(lang, Some(sub.as_str()), method),
+            );
+        }
+        out
+    }
+}
+
+//  Call-graph construction
+
+/// Build the whole-program call graph from merged summaries.
+///
+/// Resolution strategy:
+///   1. Extract leaf name for `resolve_callee_key` lookup
+///   2. Same-language, arity-filtered, namespace-disambiguated lookup
+///   3. On ambiguity: use two-segment qualified name to narrow candidates
+///   4. Interop edges (explicit cross-language bridges)
+///
+/// Typed-call devirtualisation: when the caller's SSA summary carries
+/// a typed container for a call ordinal, that site is first resolved
+/// via [`ClassMethodIndex`] restricted to the receiver type. Exact
+/// match → edge; multi-candidate → fed back through
+/// `CalleeQuery.receiver_type`; zero match → name-only fallback.
+///
+/// Unresolved and ambiguous callees are recorded for diagnostics but
+/// do **not** create edges.
+pub fn build_call_graph(summaries: &GlobalSummaries, interop_edges: &[InteropEdge]) -> CallGraph {
+    let mut graph = DiGraph::new();
+    let mut index = HashMap::new();
+
+    // 1. Create one node per FuncKey.
+    for (key, _) in summaries.iter() {
+        let idx = graph.add_node(key.clone());
+        index.insert(key.clone(), idx);
+    }
+
+    // build a single `(lang, container, name) → candidates`
+    // index from the merged summaries.  Used below to devirtualise
+    // every method-call edge whose receiver has a recoverable type
+    // fact.  Cost is one allocation per FuncKey across the program;
+    // amortised against the per-call-site savings, this is a clear
+    // win on codebases with many same-name methods.
+    let method_index = ClassMethodIndex::build(summaries);
+
+    // build a sibling `(lang, super_type) → sub_types` index
+    // from every merged summary's `hierarchy_edges`.  Consumed below
+    // to fan out method-call edges to all known concrete
+    // implementers when a receiver's static type is a super-class /
+    // trait / interface.  Empty for languages without an extractor
+    // (Go, C) and for files with no inheritance / impl declarations.
+    let hierarchy = TypeHierarchyIndex::build(summaries);
+
+    let mut unresolved_not_found = Vec::new();
+    let mut unresolved_ambiguous = Vec::new();
+
+    // 2. Resolve callees and add edges.
+    for (caller_key, summary) in summaries.iter() {
+        let caller_node = index[caller_key];
+
+        // Rebuild the caller's `use` map once per function rather than per
+        // call site.  Non-Rust callers always get `None`.
+        let rust_use_map: Option<RustUseMap> = if caller_key.lang == Lang::Rust {
+            match (&summary.rust_use_map, &summary.rust_wildcards) {
+                (None, None) => None,
+                (a, w) => Some(RustUseMap {
+                    aliases: a.clone().unwrap_or_default(),
+                    wildcards: w.clone().unwrap_or_default(),
+                }),
+            }
+        } else {
+            None
+        };
+
+        // per-caller `(call_ordinal → container_name)` map
+        // pulled from the caller's SSA summary, when one exists.
+        // Empty when the caller has no SSA summary (zero-param trivial
+        // bodies skip extraction unless they had typed receivers) or
+        // when no method call inside the caller had a recoverable
+        // receiver type.  Empty maps mean today's resolution path
+        // applies unchanged for every site in this caller.
+        let typed_receivers: HashMap<u32, &str> = summaries
+            .get_ssa(caller_key)
+            .map(|ssa| {
+                ssa.typed_call_receivers
+                    .iter()
+                    .map(|(ord, c)| (*ord, c.as_str()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for site in &summary.callees {
+            let raw_callee = site.name.as_str();
+            // Use leaf name for the initial lookup (FuncKey.name is always leaf).
+            let leaf = callee_leaf_name(raw_callee);
+            // Two-segment form for diagnostics / fallback disambiguation.
+            let qualified = normalize_callee_name(raw_callee);
+            // Structured arity carried per call site, used to disambiguate
+            // same-name/different-arity overloads during resolution.
+            let arity_hint: Option<usize> = site.arity;
+            // The receiver segment right before the leaf (`repo` in
+            // `this.repo.find`), which is what the resolver's
+            // caller-container step keys on.  `site.receiver` holds the
+            // root of the chain (`this`) and is only the fallback for a
+            // callee name that does not spell its receiver.
+            let receiver_hint: Option<&str> = site.receiver.as_deref().map(|root| {
+                let immediate = callee_container_hint(raw_callee);
+                if immediate.is_empty() {
+                    root
+                } else {
+                    immediate
+                }
+            });
+            // Name-based resolution may only produce a self edge for a call
+            // on the caller's own instance; see `site_may_call_self`.
+            let may_call_self = site_may_call_self(caller_key, raw_callee);
+
+            // Devirtualisation: for method calls whose SSA summary
+            // recorded a typed container, resolve via ClassMethodIndex
+            // first. Single match → direct edge; multi → fall through
+            // with `receiver_type` set; zero → name-only fallback so
+            // misclassified receivers never silently drop edges.
+            let typed_container: Option<&str> = if site.receiver.is_some() {
+                typed_receivers.get(&site.ordinal).copied()
+            } else {
+                None
+            };
+
+            if let Some(container) = typed_container {
+                // Resolve the typed container plus every known
+                // sub-type / impl, so a super-class / trait / interface
+                // receiver fans out to every concrete implementer.
+                // No hierarchy entry → direct-container lookup.
+                let widened: Vec<FuncKey> = hierarchy.resolve_with_hierarchy(
+                    &method_index,
+                    caller_key.lang,
+                    Some(container),
+                    leaf,
+                );
+                let arity_filtered: Vec<&FuncKey> = widened
+                    .iter()
+                    .filter(|k| match arity_hint {
+                        Some(a) => k.arity == Some(a),
+                        None => true,
+                    })
+                    .collect();
+                if arity_filtered.len() == 1 {
+                    if let Some(&target_node) = index.get(arity_filtered[0]) {
+                        graph.add_edge(
+                            caller_node,
+                            target_node,
+                            CallEdge {
+                                call_site: raw_callee.to_string(),
+                            },
+                        );
+                    }
+                    continue;
+                }
+                // multiple arity-filtered candidates means
+                // genuine virtual dispatch through a super-type, fan
+                // out to *every* implementer.  This widens edges
+                // (correctly: the call genuinely may target any
+                // implementer at runtime) so SCC sizes may grow on
+                // codebases with deep inheritance hierarchies.
+                //
+                // Authoritative narrowing via `resolve_callee` only
+                // applies when the typed container is a *concrete*
+                // class (sub-types empty); we detect this by checking
+                // whether the direct method_index lookup would yield
+                // every arity-filtered candidate.  If hierarchy
+                // expansion produced extra candidates, fan out.
+                let direct_matches: Vec<&FuncKey> = method_index
+                    .resolve(caller_key.lang, Some(container), leaf)
+                    .iter()
+                    .filter(|k| match arity_hint {
+                        Some(a) => k.arity == Some(a),
+                        None => true,
+                    })
+                    .collect();
+                if !arity_filtered.is_empty() && arity_filtered.len() > direct_matches.len() {
+                    // Hierarchy fan-out path: add an edge per
+                    // implementer.  Continue past the
+                    // `resolve_callee` block so we don't double-add.
+                    for &target_key in &arity_filtered {
+                        if let Some(&target_node) = index.get(target_key) {
+                            graph.add_edge(
+                                caller_node,
+                                target_node,
+                                CallEdge {
+                                    call_site: raw_callee.to_string(),
+                                },
+                            );
+                        }
+                    }
+                    continue;
+                }
+                // Either zero matches (fall through to legacy path) or
+                // multiple matches on the direct container, let
+                // `resolve_callee` apply its authoritative
+                // receiver_type filter + tie-breakers.
+                if !arity_filtered.is_empty() {
+                    let caller_container: Option<&str> = if caller_key.container.is_empty() {
+                        None
+                    } else {
+                        Some(caller_key.container.as_str())
+                    };
+                    let resolution = summaries.resolve_callee(&CalleeQuery {
+                        name: leaf,
+                        caller_lang: caller_key.lang,
+                        caller_namespace: &caller_key.namespace,
+                        caller_container,
+                        receiver_type: Some(container),
+                        namespace_qualifier: site.qualifier.as_deref(),
+                        receiver_var: receiver_hint,
+                        arity: arity_hint,
+                    });
+                    if let CalleeResolution::Resolved(key) = resolution
+                        && let Some(&target_node) = index.get(&key)
+                    {
+                        graph.add_edge(
+                            caller_node,
+                            target_node,
+                            CallEdge {
+                                call_site: raw_callee.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    // Authoritative receiver_type miss with multiple
+                    // bare candidates: fall through to today's path.
+                }
+            }
+
+            // Rust callers with a module-qualified call (no receiver) go
+            // through the `use`-map aware resolver first.  When the call has
+            // a structured receiver it is a method call, the qualifier is
+            // an impl/trait name, not a module path, so we fall back to the
+            // structured resolver.  All other languages skip the use-map
+            // branch entirely.
+            let use_rust_path = caller_key.lang == Lang::Rust && site.receiver.is_none();
+            let resolution = if use_rust_path {
+                summaries.resolve_callee_key_rust(
+                    leaf,
+                    site.qualifier.as_deref(),
+                    arity_hint,
+                    &caller_key.namespace,
+                    rust_use_map.as_ref(),
+                )
+            } else {
+                // Non-Rust, or Rust method call with a receiver: route
+                // through the qualified-first resolver.  We deliberately
+                // categorize each hint so the resolver can apply the right
+                // policy:
+                //
+                //   * `namespace_qualifier`, structured module/namespace
+                //     prefix (`env` in `env::var`, `http` in `http.Get`).
+                //   * `receiver_var`, syntactic receiver variable (e.g.
+                //     `obj` in `obj.method`); used only as a last tie-break.
+                //   * `caller_container`, caller's own class/impl, so bare
+                //     `foo()` inside a method resolves to the same class.
+                //
+                // The raw text-parsed container (legacy
+                // `callee_container_hint`) is only consulted when the
+                // structured `CalleeSite` fields are absent (e.g. old
+                // summaries loaded from SQLite without `qualifier`).
+                let parsed_container = {
+                    let raw = callee_container_hint(raw_callee);
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        Some(raw.to_string())
+                    }
+                };
+                let namespace_qualifier = site.qualifier.clone().or_else(|| {
+                    if site.receiver.is_none() {
+                        parsed_container.clone()
+                    } else {
+                        None
+                    }
+                });
+                let caller_container: Option<&str> = if caller_key.container.is_empty() {
+                    None
+                } else {
+                    Some(caller_key.container.as_str())
+                };
+                summaries.resolve_callee(&CalleeQuery {
+                    name: leaf,
+                    caller_lang: caller_key.lang,
+                    caller_namespace: &caller_key.namespace,
+                    caller_container,
+                    receiver_type: None,
+                    namespace_qualifier: namespace_qualifier.as_deref(),
+                    receiver_var: receiver_hint,
+                    arity: arity_hint,
+                })
+            };
+
+            match resolution {
+                CalleeResolution::Resolved(target_key) => {
+                    if let Some(&target_node) = index.get(&target_key)
+                        && (may_call_self || target_node != caller_node)
+                    {
+                        graph.add_edge(
+                            caller_node,
+                            target_node,
+                            CallEdge {
+                                call_site: raw_callee.to_string(),
+                            },
+                        );
+                    }
+                }
+                CalleeResolution::NotFound => {
+                    // Try interop edges before recording as not-found.
+                    if let Some(target_key) =
+                        resolve_via_interop(raw_callee, caller_key, interop_edges)
+                        && let Some(&target_node) = index.get(&target_key)
+                    {
+                        graph.add_edge(
+                            caller_node,
+                            target_node,
+                            CallEdge {
+                                call_site: raw_callee.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    unresolved_not_found.push(UnresolvedCallee {
+                        caller: caller_key.clone(),
+                        callee_name: raw_callee.to_string(),
+                    });
+                }
+                CalleeResolution::Ambiguous(candidates) => {
+                    // Use the two-segment qualified name to narrow ambiguous candidates.
+                    // If the callee was qualified (e.g. "env::var"), prefer candidates
+                    // whose namespace contains the qualifier prefix.
+                    if qualified != leaf {
+                        let qualifier =
+                            &qualified[..qualified.len() - leaf.len()].trim_end_matches([':', '.']);
+                        let narrowed: Vec<_> = candidates
+                            .iter()
+                            .filter(|k| k.namespace.contains(qualifier))
+                            .cloned()
+                            .collect();
+                        if narrowed.len() == 1
+                            && let Some(&target_node) = index.get(&narrowed[0])
+                            && (may_call_self || target_node != caller_node)
+                        {
+                            graph.add_edge(
+                                caller_node,
+                                target_node,
+                                CallEdge {
+                                    call_site: raw_callee.to_string(),
+                                },
+                            );
+                            continue;
+                        }
+                    }
+                    unresolved_ambiguous.push(AmbiguousCallee {
+                        caller: caller_key.clone(),
+                        callee_name: raw_callee.to_string(),
+                        candidates,
+                    });
+                }
+            }
+        }
+    }
+
+    CallGraph {
+        graph,
+        index,
+        unresolved_not_found,
+        unresolved_ambiguous,
+    }
+}
+
+/// Check interop edges for a matching cross-language bridge.
+fn resolve_via_interop(
+    raw_callee: &str,
+    caller_key: &FuncKey,
+    interop_edges: &[InteropEdge],
+) -> Option<FuncKey> {
+    for edge in interop_edges {
+        if edge.from.caller_lang == caller_key.lang
+            && edge.from.caller_namespace == caller_key.namespace
+            && edge.from.callee_symbol == raw_callee
+            && (edge.from.caller_func.is_empty() || edge.from.caller_func == caller_key.name)
+        {
+            return Some(edge.to.clone());
+        }
+    }
+    None
+}
+
+//  SCC / topological analysis
+
+/// Compute SCC decomposition and topological ordering of the call graph.
+///
+/// `petgraph::algo::tarjan_scc` returns SCCs in *reverse* topological order
+/// of the condensation DAG, i.e. leaf SCCs (no outgoing cross-SCC edges)
+/// come **first**.  That is exactly the **callee-first** order suitable for
+/// bottom-up taint propagation.
+pub fn analyse(cg: &CallGraph) -> CallGraphAnalysis {
+    let sccs = petgraph::algo::tarjan_scc(&cg.graph);
+
+    let mut node_to_scc = HashMap::with_capacity(cg.graph.node_count());
+    for (scc_idx, scc) in sccs.iter().enumerate() {
+        for &node in scc {
+            node_to_scc.insert(node, scc_idx);
+        }
+    }
+
+    // tarjan_scc already gives callee-first ordering.
+    let topo_scc_callee_first: Vec<usize> = (0..sccs.len()).collect();
+
+    CallGraphAnalysis {
+        sccs,
+        node_to_scc,
+        topo_scc_callee_first,
+    }
+}
+
+//  File-level batch ordering
+
+/// A batch of files that pass 2 analyses in parallel against the same
+/// `global_summaries` state, annotated with whether its files take part in
+/// a recursive SCC and whether any such SCC has nodes in more than one file
+/// (`cross_file`).
+///
+/// Every file in a batch sits at the same level of the file dependency
+/// DAG (see [`scc_file_batches_with_metadata`]), so no file in a batch
+/// calls into a file of a later batch, and files of the same batch only
+/// call each other when they are part of one file-level cycle.
+///
+/// `has_mutual_recursion` triggers the SCC fixed-point loop in
+/// `run_topo_batches`.  `cross_file` is a tighter
+/// signal used by joint fixed-point convergence: it implies the
+/// recursion involves at least one cross-file call edge, so the inline
+/// cache and per-iteration findings need joint convergence, not just
+/// summary convergence.
+pub struct FileBatch<'a> {
+    pub files: Vec<&'a PathBuf>,
+    pub has_mutual_recursion: bool,
+    /// True when at least one SCC contributing to this batch has nodes
+    /// in more than one distinct file (namespace).  When `true`, the
+    /// SCC iteration loop should consult the cross-file inline cache
+    /// fingerprint as part of its convergence check.
+    ///
+    /// `cross_file` ⊆ `has_mutual_recursion`: a cross-file SCC must be
+    /// recursive (else it would topo-sort linearly across files and not
+    /// be batched together).
+    pub cross_file: bool,
+    /// Fixed-point group of each file, parallel to `files`.  Files whose
+    /// functions share a recursive SCC (directly, or through a chain of
+    /// such SCCs) get the same group.  A recursive batch holds every
+    /// recursive file of its level, so one batch can carry many unrelated
+    /// groups; when the fixed-point cap is hit, only the groups that were
+    /// still changing get the unconverged tag.  Empty for non-recursive
+    /// batches.
+    pub fixpoint_group: Vec<usize>,
+    /// Per fixed-point group (indexed by the values in `fixpoint_group`):
+    /// true when any SCC in the group spans more than one file.
+    pub group_cross_file: Vec<bool>,
+}
+
+impl FileBatch<'_> {
+    /// Fixed-point group of `files[i]`.  A batch without group data
+    /// (non-recursive, or built by hand) is treated as a single group.
+    pub fn group_of(&self, i: usize) -> usize {
+        self.fixpoint_group.get(i).copied().unwrap_or(0)
+    }
+
+    /// Whether fixed-point group `group` contains an SCC that spans files.
+    /// Falls back to the batch-wide `cross_file` flag when the batch has
+    /// no group data.
+    pub fn group_is_cross_file(&self, group: usize) -> bool {
+        self.group_cross_file
+            .get(group)
+            .copied()
+            .unwrap_or(self.cross_file)
+    }
+}
+
+/// Returns `true` when the given SCC has nodes belonging to more than one
+/// distinct namespace (file).  Used to flag cross-file SCCs that need the
+/// cross-file joint fixed-point treatment.
+///
+/// Single-node SCCs always return `false`.  Multi-node SCCs whose nodes
+/// all belong to the same namespace return `false`.
+/// Reverse-edge traversal: return every [`FuncKey`] that has a call
+/// edge *into* `callee`.  Used by the Phase-B worklist to compute
+/// which callers need re-analysis after a callee's summary has
+/// changed.
+///
+/// Returns an empty vector when the callee is unknown to the call
+/// graph (e.g. summary was never produced, or the key was synthesised
+/// post-build).
+///
+/// Cost: O(in_degree) via petgraph's `Incoming` neighbours iterator;
+/// no allocation beyond the returned `Vec`.
+pub fn callers_of(cg: &CallGraph, callee: &FuncKey) -> Vec<FuncKey> {
+    let Some(&node) = cg.index.get(callee) else {
+        return Vec::new();
+    };
+    cg.graph
+        .neighbors_directed(node, petgraph::Direction::Incoming)
+        .map(|caller_node| cg.graph[caller_node].clone())
+        .collect()
+}
+
+/// Reverse-edge BFS: return every [`FuncKey`] that *transitively* calls
+/// `callee`, i.e. the union of [`callers_of`] applied recursively until
+/// the reverse frontier is exhausted.
+///
+/// Used by the chain composer to widen file-scoped reach: a sink inside
+/// `internal_helper.py` whose enclosing function is reached only through
+/// `routes.py` is *reachable* in the chain sense, but the file-local
+/// match in `chain::edges::locate_reach` / `chain::search::compose_chain`
+/// misses it.  This helper produces the closure once so callers can
+/// resolve reach in O(1) afterwards.
+///
+/// Excludes `callee` itself from the returned set, matching the
+/// "strictly upstream" semantics callers want.  Empty when `callee` is
+/// unknown to the graph.
+///
+/// Cost: O(V + E) BFS from `callee`'s reverse frontier; bounded by the
+/// connected component size.
+pub fn callers_transitive(cg: &CallGraph, callee: &FuncKey) -> std::collections::HashSet<FuncKey> {
+    let mut seen: std::collections::HashSet<FuncKey> = std::collections::HashSet::new();
+    let Some(&start) = cg.index.get(callee) else {
+        return seen;
+    };
+    let mut frontier: Vec<NodeIndex> = cg
+        .graph
+        .neighbors_directed(start, petgraph::Direction::Incoming)
+        .collect();
+    while let Some(node) = frontier.pop() {
+        let key = cg.graph[node].clone();
+        if !seen.insert(key) {
+            continue;
+        }
+        for next in cg
+            .graph
+            .neighbors_directed(node, petgraph::Direction::Incoming)
+        {
+            if !seen.contains(&cg.graph[next]) {
+                frontier.push(next);
+            }
+        }
+    }
+    seen
+}
+
+/// File-level transitive reach map built from a [`CallGraph`].
+///
+/// For each `namespace` (file path) in the graph, records every other
+/// namespace that contains at least one transitive caller.  Built once
+/// per scan so the chain composer can widen a finding's
+/// `Reach::Reachable` decision beyond the file-local heuristic in
+/// `chain::edges::locate_reach` without re-running BFS per
+/// finding.
+///
+/// Map shape: `callee_namespace → { caller_namespace, … }`.  A file
+/// always appears in its own caller set so intra-file recursion stays
+/// reachable.
+///
+/// `scan_root` is optional path-normalisation context.  Callers that
+/// build the map without a scan root must pass project-relative POSIX
+/// paths to [`FileReachMap::reaches`] directly.  When a root is set
+/// (typical in production scans), [`FileReachMap::reaches`] applies
+/// [`crate::symbol::normalize_namespace`] to its arguments before
+/// lookup so absolute host paths (the convention on
+/// [`crate::commands::scan::Diag`]'s `path`) and project-relative paths
+/// (the convention on call-graph [`FuncKey::namespace`] and
+/// [`crate::surface::SourceLocation::file`]) both resolve to the
+/// stored keys.
+#[derive(Debug, Default, Clone)]
+pub struct FileReachMap {
+    by_callee_ns: HashMap<String, std::collections::HashSet<String>>,
+    scan_root: Option<String>,
+}
+
+impl FileReachMap {
+    /// Build the map from every function's reverse transitive closure.
+    ///
+    /// O(V × (V + E)) worst case, but the per-function BFS is sparse on
+    /// real call graphs (median in-degree < 4 on the eval corpus).
+    ///
+    /// The returned map has no scan root configured; pair with
+    /// [`FileReachMap::with_scan_root`] when callers may pass absolute
+    /// paths.
+    pub fn build(cg: &CallGraph) -> Self {
+        // Call-graph namespaces are package-qualified (`pkg::rel`) for any
+        // file inside a resolved package, but `reaches` normalises its
+        // arguments via plain `normalize_namespace` (`rel`). Strip the
+        // package prefix on both keys and caller-set entries so the stored
+        // form matches the lookup form; otherwise `reaches` always returns
+        // false for package-resident files and chain reach widening /
+        // surface transitive-exposure detection silently never fire.
+        let mut by_callee_ns: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        for callee in cg.index.keys() {
+            let callee_ns = strip_package_prefix(&callee.namespace).to_string();
+            let entry = by_callee_ns.entry(callee_ns.clone()).or_default();
+            entry.insert(callee_ns);
+            for caller in callers_transitive(cg, callee) {
+                entry.insert(strip_package_prefix(&caller.namespace).to_string());
+            }
+        }
+        FileReachMap {
+            by_callee_ns,
+            scan_root: None,
+        }
+    }
+
+    /// Attach a scan root so [`FileReachMap::reaches`] can normalise
+    /// absolute host paths back to the project-relative POSIX form the
+    /// map keys use.  Pass `None` to clear an existing root.
+    pub fn with_scan_root<P: AsRef<std::path::Path>>(mut self, root: Option<P>) -> Self {
+        self.scan_root = root.map(|p| p.as_ref().to_string_lossy().into_owned());
+        self
+    }
+
+    /// True when `caller` transitively reaches at least one function
+    /// defined in `callee`.  Inputs may be either project-relative
+    /// POSIX paths (matching the call-graph namespace convention) or
+    /// absolute host paths when a scan root was set via
+    /// [`FileReachMap::with_scan_root`].  False when either path is
+    /// unknown to the graph (conservative: chain composer falls back
+    /// to the file-local heuristic).
+    pub fn reaches(&self, caller: &str, callee: &str) -> bool {
+        let lookup_callee = self.normalize(callee);
+        let lookup_caller = self.normalize(caller);
+        self.by_callee_ns
+            .get(lookup_callee.as_ref())
+            .is_some_and(|set| set.contains(lookup_caller.as_ref()))
+    }
+
+    /// Number of distinct callee namespaces tracked.  Exposed for
+    /// diagnostics / tests.
+    pub fn callee_ns_len(&self) -> usize {
+        self.by_callee_ns.len()
+    }
+
+    fn normalize<'a>(&self, path: &'a str) -> std::borrow::Cow<'a, str> {
+        // Reduce both path-normalisation (absolute → project-relative) and
+        // package-qualification (`pkg::rel` → `rel`) so lookups match the
+        // package-stripped keys stored by `build`. Inputs may arrive as
+        // absolute host paths, plain project-relative paths, or
+        // package-qualified call-graph namespaces.
+        match self.scan_root.as_deref() {
+            Some(root) => {
+                let normalized = crate::symbol::normalize_namespace(path, Some(root));
+                std::borrow::Cow::Owned(strip_package_prefix(&normalized).to_string())
+            }
+            None => std::borrow::Cow::Borrowed(strip_package_prefix(path)),
+        }
+    }
+}
+
+/// Compute the set of file namespaces that must be re-analysed when a
+/// given set of callee [`FuncKey`]s have had their summaries refined.
+///
+/// Fans out from each changed callee to its callers via
+/// [`callers_of`], then projects onto `FuncKey::namespace`.  The
+/// result is a `HashSet<String>` suitable for membership checks while
+/// filtering the batch's file list.
+///
+/// A changed callee's *own* namespace is also included, if the
+/// callee's summary was refined, the file it lives in may itself
+/// have been a caller (intra-file recursion) or may carry sibling
+/// functions whose analysis should be re-run alongside the callee
+/// for consistency.
+///
+/// Deterministic: returns a [`std::collections::HashSet`] so iteration
+/// order is not guaranteed, but membership is deterministic.  Callers
+/// that need ordered output should collect and sort.
+pub fn namespaces_for_callers(
+    cg: &CallGraph,
+    changed: &std::collections::HashSet<FuncKey>,
+) -> std::collections::HashSet<String> {
+    let mut result = std::collections::HashSet::new();
+    for key in changed {
+        result.insert(key.namespace.clone());
+        for caller in callers_of(cg, key) {
+            result.insert(caller.namespace);
+        }
+    }
+    result
+}
+
+pub fn scc_spans_files(cg: &CallGraph, scc: &[NodeIndex]) -> bool {
+    if scc.len() < 2 {
+        return false;
+    }
+    let mut iter = scc.iter();
+    let first_ns = iter.next().map(|n| cg.graph[*n].namespace.as_str());
+    let Some(first_ns) = first_ns else {
+        return false;
+    };
+    iter.any(|n| cg.graph[*n].namespace.as_str() != first_ns)
+}
+
+/// True when an SCC requires the run_topo_batches fixed-point loop.
+///
+/// A multi-node SCC is mutually recursive by definition. A **single**-node
+/// SCC is recursive only when the function calls itself directly: petgraph's
+/// `tarjan_scc` places a directly self-recursive function (`f` calls `f`) in
+/// its own singleton SCC with a self-loop edge, so `scc.len() > 1` alone
+/// misses it. Self-recursion (tree walkers, retry wrappers, recursive-descent
+/// parsers) is far more common than mutual recursion and needs the same
+/// fixed-point treatment so its summary converges against its own refined
+/// summary rather than being analysed exactly once.
+pub fn scc_is_recursive(cg: &CallGraph, scc: &[NodeIndex]) -> bool {
+    if scc.len() > 1 {
+        return true;
+    }
+    match scc.first() {
+        Some(&n) => cg.graph.contains_edge(n, n),
+        None => false,
+    }
+}
+
+/// Order the files of a scan into pass-2 batches, callee files first.
+///
+/// Batches follow the file dependency DAG, not the function-level SCC
+/// order.  File `f` depends on file `g` when any function in `f` calls a
+/// function in `g`.  The file graph is condensed into its SCCs (file-level
+/// cycles, which are common: `a` calls a helper in `b` that calls back into
+/// a leaf in `a`) and every file gets the level of its file SCC, where
+/// leaves are level 0 and every other SCC sits one above the highest file
+/// SCC it calls into.  All files of a level go into the same batch, so:
+///
+/// * a file is analysed after every file it calls into, unless the two
+///   are part of one file-level cycle, in which case they share a level;
+/// * files on the same level never call each other outside such a cycle,
+///   so they can run in parallel against the same `global_summaries`
+///   state without losing callee-first refinement;
+/// * every file of a cross-file recursive SCC lands in the same level, so
+///   the fixed-point loop iterates the whole SCC jointly.
+///
+/// Each level is split into a recursive batch (files with a function in a
+/// recursive SCC, see [`scc_is_recursive`]), which runs the fixed-point
+/// loop, followed by a non-recursive batch, which runs a single refining
+/// pass.  Recursive files are grouped by the recursive SCCs they share
+/// (`FileBatch::fixpoint_group`) so a cap hit is reported against the
+/// group that was still changing.
+///
+/// Batch membership and order depend only on the shape of the call graph,
+/// never on node insertion order or on the order of `all_files` (the
+/// parallel file walker yields paths in a different order on every run).
+/// Files inside a batch are sorted by path, which is also the order their
+/// refinements are merged back into `global_summaries`, so the schedule is
+/// reproducible across runs and thread counts.
+///
+/// Returns `(ordered_batches, orphan_files)`. Orphans are paths from
+/// `all_files` that have no functions in the call graph.
+pub fn scc_file_batches_with_metadata<'a>(
+    cg: &CallGraph,
+    analysis: &CallGraphAnalysis,
+    all_files: &'a [PathBuf],
+    root: &Path,
+) -> (Vec<FileBatch<'a>>, Vec<&'a PathBuf>) {
+    let root_str = root.to_string_lossy();
+
+    // 1. One file id per distinct namespace.
+    //
+    //    Call-graph namespaces are package-qualified (`pkg::rel`) for any
+    //    file inside a resolved package, while `all_files` below is keyed by
+    //    the plain `normalize_namespace` form (`rel`). Strip the package
+    //    prefix here so both conventions agree; otherwise every
+    //    package-resident file misses the lookup and lands in `orphans`,
+    //    silently disabling the topo/SCC machinery for exactly the repos it
+    //    was built for (any project with a named package.json).
+    let mut file_id: HashMap<&str, usize> = HashMap::new();
+    let mut node_file: Vec<usize> = Vec::with_capacity(cg.graph.node_count());
+    for node in cg.graph.node_indices() {
+        let ns = strip_package_prefix(&cg.graph[node].namespace);
+        let next = file_id.len();
+        node_file.push(*file_id.entry(ns).or_insert(next));
+    }
+    let n_files = file_id.len();
+
+    // 2. File dependency graph: `f -> g` when a function in `f` calls a
+    //    function in `g`.  Self edges are dropped; recursion inside a file
+    //    is handled by the function-level SCC metadata below.
+    let mut file_graph: DiGraph<(), ()> = DiGraph::with_capacity(n_files, 0);
+    for _ in 0..n_files {
+        file_graph.add_node(());
+    }
+    let mut seen_edges: std::collections::HashSet<(usize, usize)> =
+        std::collections::HashSet::new();
+    for edge in cg.graph.edge_references() {
+        let from = node_file[edge.source().index()];
+        let to = node_file[edge.target().index()];
+        if from != to && seen_edges.insert((from, to)) {
+            file_graph.add_edge(NodeIndex::new(from), NodeIndex::new(to), ());
+        }
+    }
+
+    // 3. Level of each file SCC.  `tarjan_scc` emits SCCs in reverse
+    //    topological order, so every callee SCC already has its level when
+    //    a caller SCC is visited.
+    let file_sccs = petgraph::algo::tarjan_scc(&file_graph);
+    let mut file_scc_of = vec![0usize; n_files];
+    for (i, scc) in file_sccs.iter().enumerate() {
+        for &n in scc {
+            file_scc_of[n.index()] = i;
+        }
+    }
+    let mut scc_level = vec![0usize; file_sccs.len()];
+    for (i, scc) in file_sccs.iter().enumerate() {
+        let mut level = 0;
+        for &n in scc {
+            for callee in file_graph.neighbors(n) {
+                let j = file_scc_of[callee.index()];
+                if j != i {
+                    debug_assert!(j < i, "tarjan_scc must emit callee SCCs first");
+                    level = level.max(scc_level[j] + 1);
+                }
+            }
+        }
+        scc_level[i] = level;
+    }
+
+    // 4. Recursion metadata.  A file is recursive when one of its
+    //    functions sits in a recursive SCC.  Files that share a recursive
+    //    SCC are unioned into one fixed-point group; a group is cross-file
+    //    when any of its SCCs spans files.
+    let mut recursive = vec![false; n_files];
+    let mut group_parent: Vec<usize> = (0..n_files).collect();
+    let mut cross_file_members: Vec<usize> = Vec::new();
+    for scc in &analysis.sccs {
+        if !scc_is_recursive(cg, scc) {
+            continue;
+        }
+        let first = node_file[scc[0].index()];
+        let mut spans_files = false;
+        for &n in scc {
+            let f = node_file[n.index()];
+            recursive[f] = true;
+            if f != first {
+                spans_files = true;
+                union_files(&mut group_parent, first, f);
+            }
+        }
+        if spans_files {
+            cross_file_members.push(first);
+        }
+    }
+    let mut group_is_cross_file = vec![false; n_files];
+    for f in cross_file_members {
+        let r = find_file_group(&mut group_parent, f);
+        group_is_cross_file[r] = true;
+    }
+
+    // 5. Bucket the files by level, in path order so merges after the
+    //    parallel section do not depend on the walker's output order.
+    let mut sorted_files: Vec<&'a PathBuf> = all_files.iter().collect();
+    sorted_files.sort();
+    #[allow(clippy::type_complexity)]
+    let mut levels: BTreeMap<usize, (Vec<(&'a PathBuf, usize)>, Vec<&'a PathBuf>)> =
+        BTreeMap::new();
+    let mut orphans: Vec<&'a PathBuf> = Vec::new();
+    for p in sorted_files {
+        let abs = p.to_string_lossy();
+        let rel = crate::symbol::normalize_namespace(&abs, Some(&root_str));
+        match file_id.get(rel.as_str()) {
+            Some(&f) => {
+                let entry = levels.entry(scc_level[file_scc_of[f]]).or_default();
+                if recursive[f] {
+                    entry.0.push((p, f));
+                } else {
+                    entry.1.push(p);
+                }
+            }
+            None => orphans.push(p),
+        }
+    }
+
+    // 6. Emit the recursive batch of each level before its non-recursive
+    //    batch.  Within a level the two only interact through a file-level
+    //    cycle; recursive helpers are more often callees than callers, so
+    //    letting the non-recursive files see their converged summaries is
+    //    the better default.
+    let mut batches: Vec<FileBatch<'a>> = Vec::new();
+    for (recursive_files, plain_files) in levels.into_values() {
+        if !recursive_files.is_empty() {
+            let mut files = Vec::with_capacity(recursive_files.len());
+            let mut fixpoint_group = Vec::with_capacity(recursive_files.len());
+            let mut group_cross_file: Vec<bool> = Vec::new();
+            let mut dense: HashMap<usize, usize> = HashMap::new();
+            for (p, f) in recursive_files {
+                let r = find_file_group(&mut group_parent, f);
+                let g = *dense.entry(r).or_insert_with(|| {
+                    group_cross_file.push(group_is_cross_file[r]);
+                    group_cross_file.len() - 1
+                });
+                files.push(p);
+                fixpoint_group.push(g);
+            }
+            let cross_file = group_cross_file.iter().any(|&c| c);
+            batches.push(FileBatch {
+                files,
+                has_mutual_recursion: true,
+                cross_file,
+                fixpoint_group,
+                group_cross_file,
+            });
+        }
+        if !plain_files.is_empty() {
+            batches.push(FileBatch {
+                files: plain_files,
+                has_mutual_recursion: false,
+                cross_file: false,
+                fixpoint_group: Vec::new(),
+                group_cross_file: Vec::new(),
+            });
+        }
+    }
+    (batches, orphans)
+}
+
+/// Union-find lookup with path halving, used to group files that share a
+/// recursive SCC in [`scc_file_batches_with_metadata`].
+fn find_file_group(parent: &mut [usize], mut f: usize) -> usize {
+    while parent[f] != f {
+        parent[f] = parent[parent[f]];
+        f = parent[f];
+    }
+    f
+}
+
+fn union_files(parent: &mut [usize], a: usize, b: usize) {
+    let ra = find_file_group(parent, a);
+    let rb = find_file_group(parent, b);
+    if ra != rb {
+        parent[rb.max(ra)] = ra.min(rb);
+    }
+}
+
+/// File lists of [`scc_file_batches_with_metadata`], without the
+/// recursion metadata.  Test-only convenience for ordering assertions.
+#[cfg(test)]
+pub(super) fn scc_file_batches<'a>(
+    cg: &CallGraph,
+    analysis: &CallGraphAnalysis,
+    all_files: &'a [PathBuf],
+    root: &Path,
+) -> (Vec<Vec<&'a PathBuf>>, Vec<&'a PathBuf>) {
+    let (batches, orphans) = scc_file_batches_with_metadata(cg, analysis, all_files, root);
+    (batches.into_iter().map(|b| b.files).collect(), orphans)
+}
+
+//  Tests
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::interop::CallSiteKey;
+    use crate::summary::{CalleeSite, FuncSummary, merge_summaries};
+    use crate::symbol::Lang;
+
+    /// Helper to create a minimal FuncSummary.
+    fn make_summary(
+        name: &str,
+        file_path: &str,
+        lang: &str,
+        param_count: usize,
+        callees: Vec<&str>,
+    ) -> FuncSummary {
+        FuncSummary {
+            name: name.into(),
+            file_path: file_path.into(),
+            lang: lang.into(),
+            param_count,
+            param_names: vec![],
+            source_caps: 0,
+            sanitizer_caps: 0,
+            sink_caps: 0,
+            propagating_params: vec![],
+            propagates_taint: false,
+            tainted_sink_params: vec![],
+            callees: callees
+                .into_iter()
+                .map(crate::summary::CalleeSite::bare)
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    // ── normalize_callee_name (two-segment) ─────────────────────────────
+
+    #[test]
+    fn normalize_callee_two_segment() {
+        // Two-segment normalization preserves one level of qualification.
+        assert_eq!(normalize_callee_name("env::var"), "env::var");
+        assert_eq!(normalize_callee_name("std::env::var"), "env::var");
+        assert_eq!(
+            normalize_callee_name("std::process::Command"),
+            "process::Command"
+        );
+        assert_eq!(normalize_callee_name("a::b::c"), "b::c");
+        assert_eq!(normalize_callee_name("obj.method"), "obj.method");
+        assert_eq!(normalize_callee_name("pkg.mod.func"), "mod.func");
+        assert_eq!(
+            normalize_callee_name("http_client.send"),
+            "http_client.send"
+        );
+        assert_eq!(normalize_callee_name("send"), "send");
+        assert_eq!(normalize_callee_name("foo"), "foo");
+        assert_eq!(normalize_callee_name(""), "");
+    }
+
+    // ── callee_leaf_name (single-segment, backward compat) ───────────────
+
+    #[test]
+    fn callee_leaf_basic() {
+        assert_eq!(callee_leaf_name("env::var"), "var");
+        assert_eq!(callee_leaf_name("std::process::Command"), "Command");
+        assert_eq!(callee_leaf_name("obj.method"), "method");
+        assert_eq!(callee_leaf_name("pkg.mod.func"), "func");
+        assert_eq!(callee_leaf_name("foo"), "foo");
+        assert_eq!(callee_leaf_name(""), "");
+    }
+
+    #[test]
+    fn rust_turbofish_does_not_hide_the_callee() {
+        assert_eq!(callee_leaf_name("run_it::<u8>"), "run_it");
+        assert_eq!(callee_leaf_name("run_it::<std::string::String>"), "run_it");
+        assert_eq!(callee_leaf_name("run_it::<fn(u8) -> u8>"), "run_it");
+        assert_eq!(callee_leaf_name("x.parse::<u32>"), "parse");
+        assert_eq!(
+            normalize_callee_name("sqlx::query_as::<_, User>"),
+            "sqlx::query_as"
+        );
+        assert_eq!(callee_container_hint("Repo::load::<Row>"), "Repo");
+        // Not a turbofish: nothing is trimmed.
+        assert_eq!(callee_leaf_name("Vec<u8>"), "Vec<u8>");
+        assert_eq!(callee_leaf_name("a < b >"), "a < b >");
+    }
+
+    // ── same name, different Rust modules ────────────────────────────────
+
+    #[test]
+    fn same_name_different_rust_modules() {
+        let helper_a = make_summary("helper", "src/a.rs", "rust", 0, vec![]);
+        let helper_b = make_summary("helper", "src/b.rs", "rust", 0, vec![]);
+        let caller = make_summary("caller", "src/a.rs", "rust", 0, vec!["helper"]);
+
+        let gs = merge_summaries(vec![helper_a, helper_b, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        // Two helper nodes + one caller node = 3 nodes
+        assert_eq!(cg.graph.node_count(), 3);
+
+        // Caller is in src/a.rs, so "helper" resolves to src/a.rs::helper
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/a.rs",
+            String::new(),
+            "caller",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let helper_a_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/a.rs",
+            String::new(),
+            "helper",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+
+        let caller_node = cg.index[&caller_key];
+        let helper_a_node = cg.index[&helper_a_key];
+
+        // Exactly one edge: caller → helper_a
+        let edges: Vec<_> = cg
+            .graph
+            .edges(caller_node)
+            .filter(|e| e.target() == helper_a_node)
+            .collect();
+        assert_eq!(edges.len(), 1);
+        assert!(cg.unresolved_not_found.is_empty());
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    // ── same name, Python vs Rust ────────────────────────────────────────
+
+    #[test]
+    fn same_name_python_and_rust() {
+        let py_foo = make_summary("foo", "handler.py", "python", 0, vec![]);
+        let rs_foo = make_summary("foo", "handler.rs", "rust", 0, vec![]);
+        // Python caller calls "foo", should only see the Python one
+        let py_caller = make_summary("main", "app.py", "python", 0, vec!["foo"]);
+
+        let gs = merge_summaries(vec![py_foo, rs_foo, py_caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        assert_eq!(cg.graph.node_count(), 3);
+
+        let py_foo_key = FuncKey::from_parts(
+            Lang::Python,
+            "handler.py",
+            String::new(),
+            "foo",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let caller_key = FuncKey::from_parts(
+            Lang::Python,
+            "app.py",
+            String::new(),
+            "main",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+
+        let caller_node = cg.index[&caller_key];
+        let py_foo_node = cg.index[&py_foo_key];
+
+        // Edge goes to Python foo, not Rust foo
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target(), py_foo_node);
+    }
+
+    // ── arity differences → separate nodes ───────────────────────────────
+
+    #[test]
+    fn arity_differences_separate_nodes() {
+        let helper1 = make_summary("helper", "lib.rs", "rust", 1, vec![]);
+        let helper2 = make_summary("helper", "lib.rs", "rust", 2, vec![]);
+
+        let gs = merge_summaries(vec![helper1, helper2], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        // Two separate nodes (different arity → different FuncKey)
+        assert_eq!(cg.graph.node_count(), 2);
+
+        let key1 = FuncKey::from_parts(
+            Lang::Rust,
+            "lib.rs",
+            String::new(),
+            "helper",
+            Some(1),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let key2 = FuncKey::from_parts(
+            Lang::Rust,
+            "lib.rs",
+            String::new(),
+            "helper",
+            Some(2),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        assert!(cg.index.contains_key(&key1));
+        assert!(cg.index.contains_key(&key2));
+    }
+
+    // ── recursive SCC detection ──────────────────────────────────────────
+
+    #[test]
+    fn recursive_scc_detection() {
+        let a = make_summary("a", "lib.rs", "rust", 0, vec!["b"]);
+        let b = make_summary("b", "lib.rs", "rust", 0, vec!["a"]);
+
+        let gs = merge_summaries(vec![a, b], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        assert_eq!(cg.graph.edge_count(), 2); // a→b and b→a
+
+        let analysis = analyse(&cg);
+
+        // Both nodes should be in the same SCC
+        let key_a = FuncKey::from_parts(
+            Lang::Rust,
+            "lib.rs",
+            String::new(),
+            "a",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let key_b = FuncKey::from_parts(
+            Lang::Rust,
+            "lib.rs",
+            String::new(),
+            "b",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+
+        let scc_a = analysis.node_to_scc[&cg.index[&key_a]];
+        let scc_b = analysis.node_to_scc[&cg.index[&key_b]];
+        assert_eq!(scc_a, scc_b);
+        assert_eq!(analysis.sccs[scc_a].len(), 2);
+    }
+
+    // ── unresolved callee → recorded as not found ────────────────────────
+
+    #[test]
+    fn unresolved_callee_recorded_as_not_found() {
+        let caller = make_summary("caller", "lib.rs", "rust", 0, vec!["nonexistent"]);
+
+        let gs = merge_summaries(vec![caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        assert_eq!(cg.graph.edge_count(), 0);
+        assert_eq!(cg.unresolved_not_found.len(), 1);
+        assert_eq!(cg.unresolved_not_found[0].callee_name, "nonexistent");
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    // ── ambiguous callee → recorded as ambiguous ─────────────────────────
+
+    #[test]
+    fn ambiguous_callee_recorded() {
+        // Two "helper" functions in different namespaces.
+        let helper_a = make_summary("helper", "a.rs", "rust", 0, vec![]);
+        let helper_b = make_summary("helper", "b.rs", "rust", 0, vec![]);
+        // Caller is in a THIRD namespace, so neither is preferred.
+        let caller = make_summary("caller", "c.rs", "rust", 0, vec!["helper"]);
+
+        let gs = merge_summaries(vec![helper_a, helper_b, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        assert_eq!(cg.graph.edge_count(), 0); // no edge, ambiguous
+        assert!(cg.unresolved_not_found.is_empty());
+        assert_eq!(cg.unresolved_ambiguous.len(), 1);
+        assert_eq!(cg.unresolved_ambiguous[0].callee_name, "helper");
+        assert_eq!(cg.unresolved_ambiguous[0].candidates.len(), 2);
+    }
+
+    // ── diamond topo order (callee-first) ────────────────────────────────
+
+    #[test]
+    fn diamond_topo_callee_first() {
+        // A → B, A → C, B → D, C → D
+        let d = make_summary("d", "lib.rs", "rust", 0, vec![]);
+        let b = make_summary("b", "lib.rs", "rust", 0, vec!["d"]);
+        let c = make_summary("c", "lib.rs", "rust", 0, vec!["d"]);
+        let a = make_summary("a", "lib.rs", "rust", 0, vec!["b", "c"]);
+
+        let gs = merge_summaries(vec![a, b, c, d], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        assert_eq!(cg.graph.node_count(), 4);
+
+        let analysis = analyse(&cg);
+
+        let key = |name: &str| {
+            FuncKey::from_parts(
+                Lang::Rust,
+                "lib.rs",
+                String::new(),
+                name,
+                Some(0),
+                None,
+                crate::symbol::FuncKind::Function,
+            )
+        };
+
+        let scc_of = |name: &str| analysis.node_to_scc[&cg.index[&key(name)]];
+        let topo_pos = |name: &str| {
+            analysis
+                .topo_scc_callee_first
+                .iter()
+                .position(|&s| s == scc_of(name))
+                .unwrap()
+        };
+
+        // D (leaf) must come before B and C, which must come before A (root).
+        assert!(topo_pos("d") < topo_pos("b"));
+        assert!(topo_pos("d") < topo_pos("c"));
+        assert!(topo_pos("b") < topo_pos("a"));
+        assert!(topo_pos("c") < topo_pos("a"));
+    }
+
+    // ── interop edge resolution ──────────────────────────────────────────
+
+    #[test]
+    fn interop_edge_resolution() {
+        let py_caller = make_summary("process", "handler.py", "python", 0, vec!["js_func"]);
+        let js_target = make_summary("js_func", "util.js", "javascript", 1, vec![]);
+
+        let gs = merge_summaries(vec![py_caller, js_target], None);
+
+        let interop = vec![InteropEdge {
+            from: CallSiteKey {
+                caller_lang: Lang::Python,
+                caller_namespace: "handler.py".into(),
+                caller_func: String::new(), // wildcard
+                callee_symbol: "js_func".into(),
+                ordinal: 0,
+            },
+            to: FuncKey::from_parts(
+                Lang::JavaScript,
+                "util.js",
+                String::new(),
+                "js_func",
+                Some(1),
+                None,
+                crate::symbol::FuncKind::Function,
+            ),
+        }];
+
+        let cg = build_call_graph(&gs, &interop);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Python,
+            "handler.py",
+            String::new(),
+            "process",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let target_key = FuncKey::from_parts(
+            Lang::JavaScript,
+            "util.js",
+            String::new(),
+            "js_func",
+            Some(1),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+
+        let caller_node = cg.index[&caller_key];
+        let target_node = cg.index[&target_key];
+
+        let edges: Vec<_> = cg
+            .graph
+            .edges(caller_node)
+            .filter(|e| e.target() == target_node)
+            .collect();
+        assert_eq!(edges.len(), 1);
+        assert!(cg.unresolved_not_found.is_empty());
+    }
+
+    // ── namespace normalization consistency ───────────────────────────────
+
+    #[test]
+    fn namespace_normalization_consistency() {
+        // FuncSummary::func_key with a scan root produces the same namespace
+        // string that would be used as caller_namespace in resolution.
+        let summary = FuncSummary {
+            name: "my_func".into(),
+            file_path: "/home/user/proj/src/lib.rs".into(),
+            lang: "rust".into(),
+            param_count: 0,
+            param_names: vec![],
+            source_caps: 0,
+            sanitizer_caps: 0,
+            sink_caps: 0,
+            propagating_params: vec![],
+            propagates_taint: false,
+            tainted_sink_params: vec![],
+            callees: vec![],
+            ..Default::default()
+        };
+
+        let root = "/home/user/proj";
+        let key = summary.func_key(Some(root));
+
+        // The namespace in the key must be the same as what normalize_namespace produces
+        let expected_ns = crate::symbol::normalize_namespace(&summary.file_path, Some(root));
+        assert_eq!(key.namespace, expected_ns);
+        assert_eq!(key.namespace, "src/lib.rs");
+    }
+
+    // ── raw call_site preserved on edge ──────────────────────────────────
+
+    #[test]
+    fn raw_call_site_preserved_on_edge() {
+        // Callee "env::var" normalizes to "var" for resolution, but
+        // the edge should retain the original raw text.
+        let source = make_summary("var", "util.rs", "rust", 0, vec![]);
+        let caller = make_summary("main", "util.rs", "rust", 0, vec!["env::var"]);
+
+        let gs = merge_summaries(vec![source, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "util.rs",
+            String::new(),
+            "main",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let caller_node = cg.index[&caller_key];
+
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(edges.len(), 1);
+        // Raw call_site preserved, not the normalized "var"
+        assert_eq!(edges[0].weight().call_site, "env::var");
+    }
+
+    // ── scc_file_batches ────────────────────────────────────────────────
+
+    /// Helper: build summaries, call graph, analysis, and file batches in one go.
+    fn build_batches<'a>(
+        summaries: Vec<FuncSummary>,
+        all_files: &'a [PathBuf],
+        root: &Path,
+    ) -> (Vec<Vec<&'a PathBuf>>, Vec<&'a PathBuf>) {
+        let gs = merge_summaries(summaries, Some(&root.to_string_lossy()));
+        let cg = build_call_graph(&gs, &[]);
+        let analysis = analyse(&cg);
+        scc_file_batches(&cg, &analysis, all_files, root)
+    }
+
+    #[test]
+    fn scc_file_batches_linear_chain() {
+        // A (a.rs) → B (b.rs) → C (c.rs)
+        let root = Path::new("/proj");
+        let c = make_summary("c_fn", "/proj/c.rs", "rust", 0, vec![]);
+        let b = make_summary("b_fn", "/proj/b.rs", "rust", 0, vec!["c_fn"]);
+        let a = make_summary("a_fn", "/proj/a.rs", "rust", 0, vec!["b_fn"]);
+
+        let files: Vec<PathBuf> = vec![
+            PathBuf::from("/proj/a.rs"),
+            PathBuf::from("/proj/b.rs"),
+            PathBuf::from("/proj/c.rs"),
+        ];
+
+        let (batches, orphans) = build_batches(vec![a, b, c], &files, root);
+
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 3, "3 files in a linear chain → 3 batches");
+
+        // C's file in first batch, B's in second, A's in third
+        let batch_of = |name: &str| {
+            batches
+                .iter()
+                .position(|batch: &Vec<&PathBuf>| {
+                    batch.iter().any(|p| p.to_str().unwrap().ends_with(name))
+                })
+                .unwrap()
+        };
+        assert!(batch_of("c.rs") < batch_of("b.rs"));
+        assert!(batch_of("b.rs") < batch_of("a.rs"));
+    }
+
+    #[test]
+    fn scc_file_batches_orphan_files() {
+        let root = Path::new("/proj");
+        let a = make_summary("a_fn", "/proj/a.rs", "rust", 0, vec![]);
+
+        let files: Vec<PathBuf> = vec![
+            PathBuf::from("/proj/a.rs"),
+            PathBuf::from("/proj/orphan.rs"),
+        ];
+
+        let (batches, orphans) = build_batches(vec![a], &files, root);
+
+        // a.rs is in the graph, orphan.rs is not
+        assert_eq!(orphans.len(), 1);
+        assert!(orphans[0].to_str().unwrap().ends_with("orphan.rs"));
+        // a.rs should be in exactly one batch
+        let total_in_batches: usize = batches.iter().map(|b: &Vec<&PathBuf>| b.len()).sum();
+        assert_eq!(total_in_batches, 1);
+    }
+
+    #[test]
+    fn scc_file_batches_multi_scc_same_file() {
+        // File has a leaf fn and a caller fn that calls through a middle
+        // function in another file:
+        //   leaf (a.rs) <- mid (b.rs) <- caller (a.rs)
+        // No function is recursive, but a.rs and b.rs call each other, so
+        // the two files form a file-level cycle.  Neither order is
+        // callee-first for every function, so they share one batch and
+        // run in parallel.  (The old min-topo rule put a.rs first because
+        // of its leaf, which left `caller` reading b.rs's pass-1 summary
+        // anyway.)
+        let root = Path::new("/proj");
+        let leaf = make_summary("leaf", "/proj/a.rs", "rust", 0, vec![]);
+        let mid = make_summary("mid", "/proj/b.rs", "rust", 0, vec!["leaf"]);
+        let caller = make_summary("caller", "/proj/a.rs", "rust", 0, vec!["mid"]);
+
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs"), PathBuf::from("/proj/b.rs")];
+
+        let (batches, orphans) = build_batches(vec![leaf, mid, caller], &files, root);
+
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 1, "file-level cycle -> one batch");
+        assert_eq!(batches[0].len(), 2);
+    }
+
+    /// Files with no call edges between them are all on level 0 and must
+    /// share one batch, in path order.  Before level batching every
+    /// file got its own batch and pass 2 ran one file at a time.
+    #[test]
+    fn scc_file_batches_independent_files_share_one_batch() {
+        let root = Path::new("/proj");
+        let names = ["a", "b", "c", "d"];
+        let summaries: Vec<FuncSummary> = names
+            .iter()
+            .map(|n| {
+                make_summary(
+                    &format!("{n}_fn"),
+                    &format!("/proj/{n}.rs"),
+                    "rust",
+                    0,
+                    vec![],
+                )
+            })
+            .collect();
+        let files: Vec<PathBuf> = names
+            .iter()
+            .map(|n| PathBuf::from(format!("/proj/{n}.rs")))
+            .collect();
+
+        let (batches, orphans) = build_metadata_batches(summaries, &files, root);
+
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 1, "independent files -> one parallel batch");
+        let got: Vec<&PathBuf> = batches[0].files.clone();
+        let want: Vec<&PathBuf> = files.iter().collect();
+        assert_eq!(got, want, "batch files are in path order");
+        assert!(!batches[0].has_mutual_recursion);
+    }
+
+    /// Files are levelled by the longest callee chain below them:
+    /// d.rs and the unrelated e.rs are leaves, b.rs and c.rs both call
+    /// d.rs, and a.rs calls b.rs and c.rs.
+    #[test]
+    fn scc_file_batches_diamond_levels() {
+        let root = Path::new("/proj");
+        let d = make_summary("d_fn", "/proj/d.rs", "rust", 0, vec![]);
+        let e = make_summary("e_fn", "/proj/e.rs", "rust", 0, vec![]);
+        let b = make_summary("b_fn", "/proj/b.rs", "rust", 0, vec!["d_fn"]);
+        let c = make_summary("c_fn", "/proj/c.rs", "rust", 0, vec!["d_fn"]);
+        let a = make_summary("a_fn", "/proj/a.rs", "rust", 0, vec!["b_fn", "c_fn"]);
+        let files: Vec<PathBuf> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|n| PathBuf::from(format!("/proj/{n}.rs")))
+            .collect();
+
+        let (batches, orphans) = build_batches(vec![a, b, c, d, e], &files, root);
+
+        assert!(orphans.is_empty());
+        let names: Vec<Vec<String>> = batches
+            .iter()
+            .map(|batch| {
+                batch
+                    .iter()
+                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                vec!["d.rs".to_string(), "e.rs".to_string()],
+                vec!["b.rs".to_string(), "c.rs".to_string()],
+                vec!["a.rs".to_string()],
+            ]
+        );
+    }
+
+    /// A file runs after every file it calls into, even when it also owns
+    /// a leaf function.  `a_main -> b_fn -> c_fn` plus a standalone
+    /// `a_leaf`: the old min-topo rule placed a.rs at its leaf's position,
+    /// ahead of b.rs, so `a_main` never saw b.rs's refined summary.
+    #[test]
+    fn scc_file_batches_caller_file_waits_for_all_callee_files() {
+        let root = Path::new("/proj");
+        let a_leaf = make_summary("a_leaf", "/proj/a.rs", "rust", 0, vec![]);
+        let a_main = make_summary("a_main", "/proj/a.rs", "rust", 0, vec!["b_fn"]);
+        let b = make_summary("b_fn", "/proj/b.rs", "rust", 0, vec!["c_fn"]);
+        let c = make_summary("c_fn", "/proj/c.rs", "rust", 0, vec![]);
+        let files: Vec<PathBuf> = ["a", "b", "c"]
+            .iter()
+            .map(|n| PathBuf::from(format!("/proj/{n}.rs")))
+            .collect();
+
+        let (batches, orphans) = build_batches(vec![a_leaf, a_main, b, c], &files, root);
+
+        assert!(orphans.is_empty());
+        let batch_of = |name: &str| {
+            batches
+                .iter()
+                .position(|batch: &Vec<&PathBuf>| {
+                    batch.iter().any(|p| p.to_str().unwrap().ends_with(name))
+                })
+                .unwrap()
+        };
+        assert!(batch_of("c.rs") < batch_of("b.rs"));
+        assert!(batch_of("b.rs") < batch_of("a.rs"));
+    }
+
+    #[test]
+    fn scc_file_batches_mutual_recursion() {
+        // Two mutually-recursive functions across two files → same SCC → same batch.
+        let root = Path::new("/proj");
+        let a = make_summary("ping", "/proj/a.rs", "rust", 0, vec!["pong"]);
+        let b = make_summary("pong", "/proj/b.rs", "rust", 0, vec!["ping"]);
+
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs"), PathBuf::from("/proj/b.rs")];
+
+        let (batches, orphans) = build_batches(vec![a, b], &files, root);
+
+        assert!(orphans.is_empty());
+        // Both files should be in the same batch (same SCC)
+        assert_eq!(
+            batches.len(),
+            1,
+            "mutual recursion → single SCC → single batch"
+        );
+        assert_eq!(batches[0].len(), 2);
+    }
+
+    #[test]
+    fn scc_file_batches_empty_graph() {
+        let root = Path::new("/proj");
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs"), PathBuf::from("/proj/b.rs")];
+
+        let gs = merge_summaries(vec![], None);
+        let cg = build_call_graph(&gs, &[]);
+        let analysis = analyse(&cg);
+        let (batches, orphans) = scc_file_batches(&cg, &analysis, &files, root);
+
+        assert!(batches.is_empty(), "empty graph → no batches");
+        assert_eq!(orphans.len(), 2, "all files are orphans");
+    }
+
+    // ── scc_file_batches_with_metadata ────────────────────────────────
+
+    /// Helper: build summaries, call graph, analysis, and metadata batches.
+    fn build_metadata_batches<'a>(
+        summaries: Vec<FuncSummary>,
+        all_files: &'a [PathBuf],
+        root: &Path,
+    ) -> (Vec<FileBatch<'a>>, Vec<&'a PathBuf>) {
+        let gs = merge_summaries(summaries, Some(&root.to_string_lossy()));
+        let cg = build_call_graph(&gs, &[]);
+        let analysis = analyse(&cg);
+        scc_file_batches_with_metadata(&cg, &analysis, all_files, root)
+    }
+
+    #[test]
+    fn scc_file_batches_with_metadata_marks_recursive() {
+        // Two mutually-recursive functions → SCC with len > 1 → has_mutual_recursion = true
+        let root = Path::new("/proj");
+        let a = make_summary("ping", "/proj/a.rs", "rust", 0, vec!["pong"]);
+        let b = make_summary("pong", "/proj/b.rs", "rust", 0, vec!["ping"]);
+
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs"), PathBuf::from("/proj/b.rs")];
+
+        let (batches, orphans) = build_metadata_batches(vec![a, b], &files, root);
+
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 1, "mutual recursion → single batch");
+        assert!(
+            batches[0].has_mutual_recursion,
+            "batch with mutual recursion should be marked"
+        );
+        assert_eq!(batches[0].files.len(), 2);
+    }
+
+    #[test]
+    fn install_called_keys_skips_self_recursion_and_test_callers() {
+        let js = |name: &str, path: &str, arity: usize, callees: Vec<&str>| {
+            make_summary(name, path, "javascript", arity, callees)
+        };
+        let mut gs = merge_summaries(
+            vec![
+                js("helper", "src/lib.js", 1, vec![]),
+                js("main", "src/app.js", 0, vec!["helper"]),
+                js("walk", "src/walk.js", 1, vec!["walk"]),
+                js("handle", "src/handle.js", 1, vec![]),
+                js("handlesInput", "src/handle.test.js", 0, vec!["handle"]),
+            ],
+            None,
+        );
+        let cg = build_call_graph(&gs, &[]);
+        gs.install_called_keys(&cg);
+        let key = |name: &str, path: &str, arity: usize| {
+            FuncKey::from_parts(
+                Lang::JavaScript,
+                path,
+                String::new(),
+                name,
+                Some(arity),
+                None,
+                crate::symbol::FuncKind::Function,
+            )
+        };
+        assert!(gs.has_known_caller(&key("helper", "src/lib.js", 1)));
+        assert!(
+            !gs.has_known_caller(&key("main", "src/app.js", 0)),
+            "nothing calls main"
+        );
+        assert!(
+            !gs.has_known_caller(&key("walk", "src/walk.js", 1)),
+            "self-recursion is not a caller"
+        );
+        assert!(
+            !gs.has_known_caller(&key("handle", "src/handle.js", 1)),
+            "a test-file caller does not make a handler internal"
+        );
+
+        // A merge invalidates the index until it is installed again.
+        gs.merge(GlobalSummaries::new());
+        assert!(!gs.has_known_caller(&key("helper", "src/lib.js", 1)));
+    }
+
+    #[test]
+    fn scc_file_batches_with_metadata_marks_cross_file() {
+        // Two mutually-recursive functions in different files → cross_file = true
+        let root = Path::new("/proj");
+        let a = make_summary("ping", "/proj/a.rs", "rust", 0, vec!["pong"]);
+        let b = make_summary("pong", "/proj/b.rs", "rust", 0, vec!["ping"]);
+
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs"), PathBuf::from("/proj/b.rs")];
+
+        let (batches, _orphans) = build_metadata_batches(vec![a, b], &files, root);
+        assert_eq!(
+            batches.len(),
+            1,
+            "cross-file mutual recursion → single batch"
+        );
+        assert!(batches[0].has_mutual_recursion);
+        assert!(
+            batches[0].cross_file,
+            "batch whose SCC spans two namespaces should be marked cross_file"
+        );
+    }
+
+    #[test]
+    fn scc_file_batches_with_metadata_intra_file_scc_not_cross_file() {
+        // Two mutually-recursive functions in the SAME file → not cross_file
+        let root = Path::new("/proj");
+        let a = make_summary("ping", "/proj/a.rs", "rust", 0, vec!["pong"]);
+        let b = make_summary("pong", "/proj/a.rs", "rust", 0, vec!["ping"]);
+
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs")];
+
+        let (batches, _orphans) = build_metadata_batches(vec![a, b], &files, root);
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].has_mutual_recursion);
+        assert!(
+            !batches[0].cross_file,
+            "single-file SCC must not be flagged as cross_file"
+        );
+    }
+
+    #[test]
+    fn scc_spans_files_single_node() {
+        // Singleton SCC is never cross-file.
+        let root = Path::new("/proj");
+        let a = make_summary("f", "/proj/a.rs", "rust", 0, vec![]);
+        let gs = merge_summaries(vec![a], Some(&root.to_string_lossy()));
+        let cg = build_call_graph(&gs, &[]);
+        let analysis = analyse(&cg);
+        for scc in &analysis.sccs {
+            assert!(!scc_spans_files(&cg, scc));
+        }
+    }
+
+    #[test]
+    fn scc_file_batches_with_metadata_singleton_not_recursive() {
+        // Linear chain: no mutual recursion → has_mutual_recursion = false for all batches
+        let root = Path::new("/proj");
+        let c = make_summary("c_fn", "/proj/c.rs", "rust", 0, vec![]);
+        let b = make_summary("b_fn", "/proj/b.rs", "rust", 0, vec!["c_fn"]);
+        let a = make_summary("a_fn", "/proj/a.rs", "rust", 0, vec!["b_fn"]);
+
+        let files: Vec<PathBuf> = vec![
+            PathBuf::from("/proj/a.rs"),
+            PathBuf::from("/proj/b.rs"),
+            PathBuf::from("/proj/c.rs"),
+        ];
+
+        let (batches, orphans) = build_metadata_batches(vec![a, b, c], &files, root);
+
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 3, "3 files in linear chain → 3 batches");
+        for (i, batch) in batches.iter().enumerate() {
+            assert!(
+                !batch.has_mutual_recursion,
+                "batch {i} should not be marked as recursive"
+            );
+        }
+    }
+
+    // ── package-prefix namespace alignment (finding #35) ──────────────
+
+    #[test]
+    fn strip_package_prefix_handles_qualified_and_plain() {
+        // Package-qualified: prefix stripped at the first "::".
+        assert_eq!(strip_package_prefix("myapp::src/a.js"), "src/a.js");
+        assert_eq!(strip_package_prefix("@scope/name::src/a.ts"), "src/a.ts");
+        // Plain relative path with no package prefix is returned verbatim.
+        assert_eq!(strip_package_prefix("src/a.js"), "src/a.js");
+        assert_eq!(strip_package_prefix("a.rs"), "a.rs");
+        assert_eq!(strip_package_prefix(""), "");
+    }
+
+    /// A call graph whose namespaces are package-qualified (the normal case
+    /// for any repo with a named package.json) must still match the plain
+    /// `normalize_namespace` file paths in `all_files`, so files land in
+    /// topo batches rather than `orphans`.
+    #[test]
+    fn scc_file_batches_with_metadata_matches_package_qualified_ns() {
+        let root = Path::new("/proj");
+        // file_path values are NOT prefixed by root, so func_key keeps them
+        // verbatim → simulates package-qualified call-graph namespaces.
+        let a = make_summary("ping", "myapp::a.rs", "rust", 0, vec!["pong"]);
+        let b = make_summary("pong", "myapp::b.rs", "rust", 0, vec!["ping"]);
+
+        // all_files are absolute paths under root → normalize to "a.rs"/"b.rs".
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs"), PathBuf::from("/proj/b.rs")];
+
+        let (batches, orphans) = build_metadata_batches(vec![a, b], &files, root);
+
+        assert!(
+            orphans.is_empty(),
+            "package-qualified files must not be orphaned: {orphans:?}"
+        );
+        assert_eq!(batches.len(), 1, "mutual recursion → single batch");
+        assert!(batches[0].has_mutual_recursion);
+    }
+
+    /// FileReachMap built from a package-qualified call graph must resolve
+    /// plain-relative `reaches` lookups.
+    #[test]
+    fn file_reach_map_matches_package_qualified_ns() {
+        let handle = make_summary("handle", "myapp::routes.rs", "rust", 0, vec!["sink"]);
+        let sink = make_summary("sink", "myapp::helper.rs", "rust", 0, vec![]);
+        let gs = merge_summaries(vec![handle, sink], None);
+        let cg = build_call_graph(&gs, &[]);
+        let reach = FileReachMap::build(&cg);
+
+        // Plain-relative lookups resolve even though graph keys are qualified.
+        assert!(reach.reaches("routes.rs", "helper.rs"));
+        // A package-qualified caller string also resolves (normalize strips it).
+        assert!(reach.reaches("myapp::routes.rs", "helper.rs"));
+    }
+
+    // ── self-recursion fixed-point flag (finding #39) ─────────────────
+
+    /// A directly self-recursive function forms a singleton SCC with a
+    /// self-loop edge. `scc_is_recursive` must flag it so run_topo_batches
+    /// applies the fixed-point loop, matching the mutual-recursion path.
+    #[test]
+    fn scc_is_recursive_flags_self_loop_singleton() {
+        let root = Path::new("/proj");
+        let f = make_summary("f", "/proj/a.rs", "rust", 0, vec!["f"]);
+        let gs = merge_summaries(vec![f], Some(&root.to_string_lossy()));
+        let cg = build_call_graph(&gs, &[]);
+        let analysis = analyse(&cg);
+
+        // The single SCC is a self-loop singleton.
+        assert_eq!(analysis.sccs.len(), 1);
+        assert!(
+            scc_is_recursive(&cg, &analysis.sccs[0]),
+            "self-recursive singleton must be flagged recursive"
+        );
+        // scc_spans_files correctly stays false for singletons.
+        assert!(!scc_spans_files(&cg, &analysis.sccs[0]));
+    }
+
+    /// A non-recursive singleton (no self-edge) must NOT be flagged.
+    #[test]
+    fn scc_is_recursive_ignores_plain_singleton() {
+        let root = Path::new("/proj");
+        let f = make_summary("f", "/proj/a.rs", "rust", 0, vec![]);
+        let gs = merge_summaries(vec![f], Some(&root.to_string_lossy()));
+        let cg = build_call_graph(&gs, &[]);
+        let analysis = analyse(&cg);
+        assert_eq!(analysis.sccs.len(), 1);
+        assert!(!scc_is_recursive(&cg, &analysis.sccs[0]));
+    }
+
+    /// The self-recursive flag propagates through to the FileBatch metadata.
+    #[test]
+    fn scc_file_batches_with_metadata_marks_self_recursive() {
+        let root = Path::new("/proj");
+        let f = make_summary("f", "/proj/a.rs", "rust", 0, vec!["f"]);
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs")];
+        let (batches, orphans) = build_metadata_batches(vec![f], &files, root);
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 1);
+        assert!(
+            batches[0].has_mutual_recursion,
+            "self-recursive file must be flagged for the fixed-point loop"
+        );
+    }
+
+    /// Every file of a cross-file recursive SCC must land in the same
+    /// batch so the fixed-point loop iterates the SCC jointly, even when
+    /// one of the files also owns an unrelated leaf function.  The old
+    /// min-topo rule split them: a.rs went to its leaf's position and the
+    /// SCC's fixed point ran over b.rs alone.
+    #[test]
+    fn scc_file_batches_with_metadata_keeps_cross_file_scc_joint() {
+        let root = Path::new("/proj");
+        let leaf = make_summary("a_leaf", "/proj/a.rs", "rust", 0, vec![]);
+        let ping = make_summary("ping", "/proj/a.rs", "rust", 0, vec!["pong"]);
+        let pong = make_summary("pong", "/proj/b.rs", "rust", 0, vec!["ping"]);
+        let files: Vec<PathBuf> = vec![PathBuf::from("/proj/a.rs"), PathBuf::from("/proj/b.rs")];
+
+        let (batches, orphans) = build_metadata_batches(vec![leaf, ping, pong], &files, root);
+
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].files.len(), 2);
+        assert!(batches[0].has_mutual_recursion);
+        assert!(batches[0].cross_file);
+        assert_eq!(batches[0].group_of(0), batches[0].group_of(1));
+        assert!(batches[0].group_is_cross_file(batches[0].group_of(0)));
+    }
+
+    /// Recursive and non-recursive files of one level go into separate
+    /// batches, recursive first.  Unrelated recursive files keep separate
+    /// fixed-point groups so a cap hit in one does not tag the other.
+    #[test]
+    fn scc_file_batches_with_metadata_splits_level_and_groups_recursive_files() {
+        let root = Path::new("/proj");
+        let ping = make_summary("ping", "/proj/a.rs", "rust", 0, vec!["pong"]);
+        let pong = make_summary("pong", "/proj/b.rs", "rust", 0, vec!["ping"]);
+        let walk = make_summary("walk", "/proj/c.rs", "rust", 0, vec!["walk"]);
+        let plain = make_summary("plain", "/proj/d.rs", "rust", 0, vec![]);
+        let files: Vec<PathBuf> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| PathBuf::from(format!("/proj/{n}.rs")))
+            .collect();
+
+        let (batches, orphans) =
+            build_metadata_batches(vec![ping, pong, walk, plain], &files, root);
+
+        assert!(orphans.is_empty());
+        assert_eq!(batches.len(), 2, "one level -> recursive + plain batch");
+
+        let rec = &batches[0];
+        assert!(rec.has_mutual_recursion);
+        assert!(rec.cross_file);
+        let rec_names: Vec<&str> = rec
+            .files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(rec_names, vec!["a.rs", "b.rs", "c.rs"]);
+        assert_eq!(rec.fixpoint_group.len(), 3);
+        assert_eq!(rec.group_of(0), rec.group_of(1), "ping/pong share a group");
+        assert_ne!(rec.group_of(0), rec.group_of(2), "walk is its own group");
+        assert!(rec.group_is_cross_file(rec.group_of(0)));
+        assert!(!rec.group_is_cross_file(rec.group_of(2)));
+
+        let plain_batch = &batches[1];
+        assert!(!plain_batch.has_mutual_recursion);
+        assert!(!plain_batch.cross_file);
+        assert_eq!(plain_batch.files.len(), 1);
+        assert!(plain_batch.files[0].ends_with("d.rs"));
+    }
+
+    /// Batch membership, order and metadata depend only on the call-graph
+    /// shape: not on the order summaries were merged in (which decides
+    /// node insertion order and hence tarjan's output), and not on the
+    /// order of `all_files` (the parallel walker's order varies by run).
+    #[test]
+    fn scc_file_batches_with_metadata_independent_of_summary_order() {
+        let root = Path::new("/proj");
+        let make_all = || {
+            vec![
+                make_summary("ping", "/proj/a.rs", "rust", 0, vec!["pong"]),
+                make_summary("pong", "/proj/b.rs", "rust", 0, vec!["ping", "util"]),
+                make_summary("util", "/proj/c.rs", "rust", 0, vec![]),
+                make_summary("walk", "/proj/d.rs", "rust", 0, vec!["walk", "util"]),
+                make_summary("main", "/proj/e.rs", "rust", 0, vec!["ping", "walk"]),
+                make_summary("solo", "/proj/f.rs", "rust", 0, vec![]),
+            ]
+        };
+        let files: Vec<PathBuf> = ["a", "b", "c", "d", "e", "f"]
+            .iter()
+            .map(|n| PathBuf::from(format!("/proj/{n}.rs")))
+            .collect();
+
+        type Shape = Vec<(Vec<String>, bool, bool, Vec<usize>, Vec<bool>)>;
+        let shape_with = |summaries: Vec<FuncSummary>, files: &[PathBuf]| -> Shape {
+            let (batches, orphans) = build_metadata_batches(summaries, files, root);
+            assert!(orphans.is_empty());
+            batches
+                .into_iter()
+                .map(|b| {
+                    (
+                        b.files
+                            .iter()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .collect(),
+                        b.has_mutual_recursion,
+                        b.cross_file,
+                        b.fixpoint_group,
+                        b.group_cross_file,
+                    )
+                })
+                .collect()
+        };
+
+        let shape = |summaries: Vec<FuncSummary>| shape_with(summaries, &files);
+
+        let forward = shape(make_all());
+        let mut reversed = make_all();
+        reversed.reverse();
+        assert_eq!(forward, shape(reversed));
+        let mut rotated = make_all();
+        rotated.rotate_left(2);
+        assert_eq!(forward, shape(rotated));
+        let mut walker_order = files.clone();
+        walker_order.reverse();
+        walker_order.rotate_left(1);
+        assert_eq!(forward, shape_with(make_all(), &walker_order));
+
+        // Level 0: c.rs (leaf util) and f.rs; level 1: the ping/pong
+        // cycle (a.rs, b.rs) and self-recursive d.rs; level 2: e.rs.
+        let files_of = |i: usize| forward[i].0.clone();
+        assert_eq!(files_of(0), vec!["/proj/c.rs", "/proj/f.rs"]);
+        assert_eq!(files_of(1), vec!["/proj/a.rs", "/proj/b.rs", "/proj/d.rs"]);
+        assert!(forward[1].1, "level-1 recursive batch");
+        assert_eq!(files_of(2), vec!["/proj/e.rs"]);
+        assert_eq!(forward.len(), 3);
+    }
+
+    // ── qualified disambiguation resolves ambiguous common names ──────
+
+    #[test]
+    fn qualified_callee_disambiguates_ambiguous() {
+        // Two "send" functions in different namespaces.
+        let send_http = make_summary("send", "src/http.rs", "rust", 0, vec![]);
+        let send_mail = make_summary("send", "src/mail.rs", "rust", 0, vec![]);
+        // Caller is in a third namespace, calling "http::send", leaf "send"
+        // is ambiguous, but "http" qualifier should match "src/http.rs".
+        let caller = make_summary("caller", "src/main.rs", "rust", 0, vec!["http::send"]);
+
+        let gs = merge_summaries(vec![send_http, send_mail, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "caller",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let send_http_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/http.rs",
+            String::new(),
+            "send",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+
+        let caller_node = cg.index[&caller_key];
+        let send_http_node = cg.index[&send_http_key];
+
+        // The qualified name "http::send" disambiguates to src/http.rs::send
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "qualified name should resolve the ambiguity"
+        );
+        assert_eq!(edges[0].target(), send_http_node);
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    #[test]
+    fn unqualified_callee_stays_ambiguous() {
+        // Same setup but caller uses unqualified "send", no disambiguation
+        let send_http = make_summary("send", "src/http.rs", "rust", 0, vec![]);
+        let send_mail = make_summary("send", "src/mail.rs", "rust", 0, vec![]);
+        let caller = make_summary("caller", "src/main.rs", "rust", 0, vec!["send"]);
+
+        let gs = merge_summaries(vec![send_http, send_mail, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "caller",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let caller_node = cg.index[&caller_key];
+
+        // Unqualified "send" → still ambiguous (no edge)
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(edges.len(), 0, "unqualified name should remain ambiguous");
+        assert_eq!(cg.unresolved_ambiguous.len(), 1);
+    }
+
+    #[test]
+    fn simple_unqualified_resolves_as_before() {
+        // Regression: a simple unqualified callee that isn't ambiguous should still resolve.
+        let helper = make_summary("helper", "src/lib.rs", "rust", 0, vec![]);
+        let caller = make_summary("caller", "src/lib.rs", "rust", 0, vec!["helper"]);
+
+        let gs = merge_summaries(vec![helper, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        assert_eq!(cg.graph.edge_count(), 1);
+        assert!(cg.unresolved_not_found.is_empty());
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    // ── structured-metadata disambiguation (callee metadata) ─────────────
+
+    /// Helper: build a summary whose callees carry structured CalleeSite
+    /// metadata, used by the tests below to exercise arity / receiver /
+    /// qualifier propagation into resolution.
+    fn summary_with_sites(
+        name: &str,
+        file_path: &str,
+        lang: &str,
+        param_count: usize,
+        sites: Vec<CalleeSite>,
+    ) -> FuncSummary {
+        FuncSummary {
+            name: name.into(),
+            file_path: file_path.into(),
+            lang: lang.into(),
+            param_count,
+            param_names: vec![],
+            source_caps: 0,
+            sanitizer_caps: 0,
+            sink_caps: 0,
+            propagating_params: vec![],
+            propagates_taint: false,
+            tainted_sink_params: vec![],
+            callees: sites,
+            ..Default::default()
+        }
+    }
+
+    /// Arity in the structured `CalleeSite` must disambiguate two same-name
+    /// overloads in the same namespace that previously could only be
+    /// distinguished after caller-namespace narrowing.
+    #[test]
+    fn arity_hint_disambiguates_same_name_overloads() {
+        // Two `encode` functions in the same file, different arities.
+        let encode1 = make_summary("encode", "src/codec.rs", "rust", 1, vec![]);
+        let encode2 = make_summary("encode", "src/codec.rs", "rust", 2, vec![]);
+        // Caller lives in *another* file so namespace does not disambiguate ,
+        // the only signal is the per-call-site arity.
+        let caller = summary_with_sites(
+            "driver",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "encode".into(),
+                arity: Some(2),
+                ..Default::default()
+            }],
+        );
+
+        let gs = merge_summaries(vec![encode1, encode2, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "driver",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let encode2_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/codec.rs",
+            String::new(),
+            "encode",
+            Some(2),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let caller_node = cg.index[&caller_key];
+        let encode2_node = cg.index[&encode2_key];
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(edges.len(), 1, "arity hint should pick the 2-arg overload");
+        assert_eq!(edges[0].target(), encode2_node);
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    /// Without an arity hint the same setup would be genuinely ambiguous.
+    /// This is the negative control for the arity disambiguation test above.
+    #[test]
+    fn no_arity_hint_stays_ambiguous() {
+        let encode1 = make_summary("encode", "src/codec.rs", "rust", 1, vec![]);
+        let encode2 = make_summary("encode", "src/codec.rs", "rust", 2, vec![]);
+        // Legacy-style callee entry with no structured metadata.
+        let caller = summary_with_sites(
+            "driver",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite::bare("encode")],
+        );
+
+        let gs = merge_summaries(vec![encode1, encode2, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+        assert_eq!(cg.graph.edge_count(), 0, "no arity hint → ambiguous");
+        assert_eq!(cg.unresolved_ambiguous.len(), 1);
+    }
+
+    /// Structured `receiver` field should route to the correct container
+    /// when two classes in the same file define the same method name.
+    #[test]
+    fn receiver_field_disambiguates_methods() {
+        // Two `process` methods on two classes in the same file.
+        let mut fs_order = make_summary("process", "src/app.rs", "rust", 1, vec![]);
+        fs_order.container = "OrderService".into();
+        let mut fs_user = make_summary("process", "src/app.rs", "rust", 1, vec![]);
+        fs_user.container = "UserService".into();
+
+        // Caller in another file uses the structured receiver field rather
+        // than baking the receiver into the callee name string.
+        let caller = summary_with_sites(
+            "main",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "process".into(),
+                arity: Some(1),
+                receiver: Some("OrderService".into()),
+                ..Default::default()
+            }],
+        );
+
+        let gs = merge_summaries(vec![fs_order, fs_user, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "main",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let order_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/app.rs",
+            "OrderService",
+            "process",
+            Some(1),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let caller_node = cg.index[&caller_key];
+        let order_node = cg.index[&order_key];
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "structured receiver should route to OrderService::process"
+        );
+        assert_eq!(edges[0].target(), order_node);
+    }
+
+    /// The `qualifier` field carries the non-method qualifier (`env` in
+    /// `env::var`) directly, removing the need to re-parse the raw string.
+    #[test]
+    fn qualifier_field_disambiguates_non_method_calls() {
+        let var_env = make_summary("var", "src/env.rs", "rust", 1, vec![]);
+        // A same-named function that would otherwise be a tie-breaker target.
+        let var_local = make_summary("var", "src/locals.rs", "rust", 1, vec![]);
+        let caller = summary_with_sites(
+            "main",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "env::var".into(),
+                arity: Some(1),
+                qualifier: Some("env".into()),
+                ..Default::default()
+            }],
+        );
+
+        let gs = merge_summaries(vec![var_env, var_local, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "main",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let env_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/env.rs",
+            String::new(),
+            "var",
+            Some(1),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let caller_node = cg.index[&caller_key];
+        let env_node = cg.index[&env_key];
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            edges[0].target(),
+            env_node,
+            "qualifier `env` should select src/env.rs::var"
+        );
+    }
+
+    /// When the legacy `Vec<String>` form is loaded from an old database row,
+    /// resolution should still work for unambiguous callers (no regression).
+    #[test]
+    fn legacy_string_callees_still_resolve() {
+        let helper = make_summary("helper", "src/lib.rs", "rust", 0, vec![]);
+        // make_summary already returns CalleeSite::bare entries, i.e. the
+        // "lifted legacy" form with no arity or receiver metadata.
+        let caller = make_summary("main", "src/lib.rs", "rust", 0, vec!["helper"]);
+        let gs = merge_summaries(vec![helper, caller], None);
+        let cg = build_call_graph(&gs, &[]);
+        assert_eq!(cg.graph.edge_count(), 1);
+        assert!(cg.unresolved_not_found.is_empty());
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    // ── ClassMethodIndex ────────────────────────────────────────────────
+
+    /// Helper: `(name, container)` pairs in the same file.  Builds two
+    /// summaries with the same leaf name on different containers so the
+    /// container-keyed map has a non-trivial discriminator to preserve.
+    fn make_method_summary(
+        name: &str,
+        container: &str,
+        file_path: &str,
+        lang: &str,
+        param_count: usize,
+    ) -> FuncSummary {
+        let mut s = make_summary(name, file_path, lang, param_count, vec![]);
+        s.container = container.into();
+        s
+    }
+
+    #[test]
+    fn class_method_index_disambiguates_same_name_across_containers() {
+        // Two `findById` definitions on different classes in different
+        // files.  The container-keyed lookup must return only the
+        // container-matching candidate; the bare-name lookup must
+        // return both.
+        let repo = make_method_summary("findById", "Repository", "src/repo.rs", "rust", 1);
+        let cache = make_method_summary("findById", "Cache", "src/cache.rs", "rust", 1);
+
+        let gs = merge_summaries(vec![repo, cache], None);
+        let idx = ClassMethodIndex::build(&gs);
+
+        let repo_hits = idx.resolve(Lang::Rust, Some("Repository"), "findById");
+        assert_eq!(
+            repo_hits.len(),
+            1,
+            "Repository::findById should resolve to exactly one target"
+        );
+        assert_eq!(repo_hits[0].container, "Repository");
+
+        let cache_hits = idx.resolve(Lang::Rust, Some("Cache"), "findById");
+        assert_eq!(cache_hits.len(), 1);
+        assert_eq!(cache_hits[0].container, "Cache");
+
+        // Bare-name lookup keeps both candidates, fallback behaviour.
+        let bare_hits = idx.resolve(Lang::Rust, None, "findById");
+        assert_eq!(
+            bare_hits.len(),
+            2,
+            "bare-name lookup should keep both same-name candidates"
+        );
+    }
+
+    #[test]
+    fn class_method_index_falls_back_to_name_when_container_unknown() {
+        // `None` container or empty-string container both route to
+        // the bare-name index, equivalent to today's name-only edge
+        // insertion.
+        let svc = make_method_summary("process", "OrderService", "src/svc.rs", "rust", 1);
+        let helper = make_summary("process", "src/util.rs", "rust", 1, vec![]);
+
+        let gs = merge_summaries(vec![svc, helper], None);
+        let idx = ClassMethodIndex::build(&gs);
+
+        // None → bare-name list (both targets).
+        let none_hits = idx.resolve(Lang::Rust, None, "process");
+        assert_eq!(none_hits.len(), 2);
+
+        // Empty string container behaves identically to None, it is
+        // not stored under any container key.
+        let empty_hits = idx.resolve(Lang::Rust, Some(""), "process");
+        assert_eq!(empty_hits.len(), 2);
+
+        // Container `"OrderService"` narrows to the method only; the
+        // free-function helper lives under empty container and does
+        // not appear here.
+        let cont_hits = idx.resolve(Lang::Rust, Some("OrderService"), "process");
+        assert_eq!(cont_hits.len(), 1);
+        assert_eq!(cont_hits[0].container, "OrderService");
+    }
+
+    #[test]
+    fn class_method_index_empty_for_unknown_method() {
+        let svc = make_method_summary("findById", "Repository", "src/repo.rs", "rust", 1);
+        let gs = merge_summaries(vec![svc], None);
+        let idx = ClassMethodIndex::build(&gs);
+
+        // Wrong method name on the right container → empty.
+        assert!(
+            idx.resolve(Lang::Rust, Some("Repository"), "findByName")
+                .is_empty()
+        );
+        // Right method, wrong container → empty (no fallback to bare-name
+        // when a container is supplied, that's the whole devirtualisation
+        // promise).
+        assert!(
+            idx.resolve(Lang::Rust, Some("OtherClass"), "findById")
+                .is_empty()
+        );
+        // Unknown method name with no container → empty.
+        assert!(idx.resolve(Lang::Rust, None, "doesNotExist").is_empty());
+    }
+
+    #[test]
+    fn class_method_index_partitions_by_language() {
+        // Same `(container, name)` in Java and TypeScript → must not
+        // alias.  Cross-language calls are forbidden by the rest of the
+        // pipeline; the index reflects that partition.
+        let java_repo = make_method_summary("findById", "Repository", "Repo.java", "java", 1);
+        let ts_repo = make_method_summary("findById", "Repository", "repo.ts", "typescript", 1);
+
+        let gs = merge_summaries(vec![java_repo, ts_repo], None);
+        let idx = ClassMethodIndex::build(&gs);
+
+        let java_hits = idx.resolve(Lang::Java, Some("Repository"), "findById");
+        assert_eq!(java_hits.len(), 1);
+        assert_eq!(java_hits[0].lang, Lang::Java);
+
+        let ts_hits = idx.resolve(Lang::TypeScript, Some("Repository"), "findById");
+        assert_eq!(ts_hits.len(), 1);
+        assert_eq!(ts_hits[0].lang, Lang::TypeScript);
+    }
+
+    #[test]
+    fn class_method_index_handles_arity_overloads() {
+        // Two arity overloads on the same container are both kept under
+        // the same `(container, name)` key, arity narrowing is the
+        // caller's responsibility (today's resolver also does this).
+        let one = make_method_summary("encode", "Codec", "src/codec.rs", "rust", 1);
+        let two = make_method_summary("encode", "Codec", "src/codec.rs", "rust", 2);
+
+        let gs = merge_summaries(vec![one, two], None);
+        let idx = ClassMethodIndex::build(&gs);
+
+        let hits = idx.resolve(Lang::Rust, Some("Codec"), "encode");
+        assert_eq!(
+            hits.len(),
+            2,
+            "arity overloads should both appear under the same container key"
+        );
+    }
+
+    // ── devirtualised edge insertion via typed_call_receivers ──
+
+    /// Two `findById` definitions live on different containers in
+    /// different files.  A caller whose SSA summary records the
+    /// receiver type as `"Repository"` for the relevant ordinal must
+    /// produce an edge **only** to `Repository::findById`, not to
+    /// `Cache::findById`.  Without typed_call_receivers, today's
+    /// receiver_var-based resolution would have to guess between the
+    /// two and would record the call as ambiguous (no edge at all).
+    #[test]
+    fn typed_call_receivers_devirtualises_method_call() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let repo = make_method_summary("findById", "Repository", "src/repo.rs", "rust", 1);
+        let cache = make_method_summary("findById", "Cache", "src/cache.rs", "rust", 1);
+        // Caller's SSA summary will record `(ordinal=0, "Repository")`
+        // for the single method call below.
+        let caller = summary_with_sites(
+            "lookup",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "findById".into(),
+                arity: Some(1),
+                receiver: Some("repo".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![repo, cache, caller], None);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "lookup",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "Repository".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+
+        let repo_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/repo.rs",
+            "Repository",
+            "findById",
+            Some(1),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let caller_node = cg.index[&caller_key];
+        let repo_node = cg.index[&repo_key];
+
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        assert_eq!(
+            edges.len(),
+            1,
+            "typed receiver should resolve to exactly one target; got {edges:?}"
+        );
+        assert_eq!(
+            edges[0].target(),
+            repo_node,
+            "edge must point to Repository::findById, not Cache::findById"
+        );
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    /// Negative control: when typed_call_receivers points at a
+    /// container that doesn't define the method, devirtualisation
+    /// must NOT silently drop the edge.  We fall through to today's
+    /// name-only resolution so a stale or misclassified type fact
+    /// can never cause regression.
+    #[test]
+    fn typed_call_receivers_falls_through_on_zero_match() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        // Single `process` on `Worker`.  No `process` exists on
+        // `Other`, that's the receiver type the caller's SSA
+        // summary will (incorrectly) record.
+        let worker = make_method_summary("process", "Worker", "src/worker.rs", "rust", 1);
+        let caller = summary_with_sites(
+            "drive",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "process".into(),
+                arity: Some(1),
+                receiver: Some("worker".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![worker, caller], None);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "drive",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                // Wrong receiver type, `Other::process` does not exist.
+                typed_call_receivers: vec![(0, "Other".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+
+        let caller_node = cg.index[&caller_key];
+        let edges: Vec<_> = cg.graph.edges(caller_node).collect();
+        // Today's name-only resolution finds the unique `process`
+        // candidate (Worker::process) and records the edge.  The
+        // typed_call_receivers miss must not have suppressed it.
+        assert_eq!(
+            edges.len(),
+            1,
+            "stale/wrong type fact must fall through to today's resolution; \
+             got {edges:?} (cf. ambiguous: {:?})",
+            cg.unresolved_ambiguous,
+        );
+    }
+
+    // ── TypeHierarchyIndex ───────────────────────────────────
+
+    /// Helper: build a hierarchy index from a list of
+    /// `(lang, sub, super)` edges by injecting them onto a single
+    /// per-file FuncSummary.  Mirrors the production path:
+    /// `merge_summaries` would receive these via
+    /// `FuncSummary::hierarchy_edges`.
+    fn hierarchy_from_edges(edges: Vec<(Lang, &str, &str)>) -> TypeHierarchyIndex {
+        let mut summary = make_summary("dummy", "dummy.rs", "rust", 0, vec![]);
+        // The lang on the FuncSummary is per-edge, so we group by
+        // language and produce one summary per language.
+        let mut by_lang: std::collections::HashMap<Lang, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for (lang, sub, sup) in edges {
+            by_lang
+                .entry(lang)
+                .or_default()
+                .push((sub.to_string(), sup.to_string()));
+        }
+        let _ = &mut summary; // silence the dummy
+        let mut all: Vec<FuncSummary> = Vec::new();
+        for (lang, edges) in by_lang {
+            let slug = match lang {
+                Lang::Rust => "rust",
+                Lang::Java => "java",
+                Lang::Python => "python",
+                Lang::TypeScript => "typescript",
+                Lang::JavaScript => "javascript",
+                Lang::Go => "go",
+                Lang::Php => "php",
+                Lang::Ruby => "ruby",
+                Lang::C => "c",
+                Lang::Cpp => "cpp",
+            };
+            let mut s = make_summary("dummy", "dummy.x", slug, 0, vec![]);
+            s.hierarchy_edges = edges;
+            all.push(s);
+        }
+        let gs = merge_summaries(all, None);
+        TypeHierarchyIndex::build(&gs)
+    }
+
+    /// B-1: Round-trip, a hierarchy built from a small set of edges
+    /// answers `subs_of` correctly and `super_keys_len` matches the
+    /// distinct super count.
+    #[test]
+    fn b1_type_hierarchy_index_round_trip() {
+        let h = hierarchy_from_edges(vec![
+            (Lang::Java, "UserRepo", "Repository"),
+            (Lang::Java, "CacheRepo", "Repository"),
+            (Lang::Java, "Derived", "Base"),
+        ]);
+        let mut subs: Vec<&str> = h
+            .subs_of(Lang::Java, "Repository")
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        subs.sort();
+        assert_eq!(subs, vec!["CacheRepo", "UserRepo"]);
+        assert_eq!(h.subs_of(Lang::Java, "Base"), &["Derived".to_string()]);
+        assert_eq!(h.subs_of(Lang::Java, "Unknown"), &[] as &[String]);
+        assert_eq!(h.super_keys_len(), 2);
+    }
+
+    /// B-2: Java interface dispatch, `Repository r; r.findById(...)`
+    /// fans out to every concrete implementer's `findById`.
+    #[test]
+    fn b2_java_interface_dispatch_fans_out_to_all_impls() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let user_repo = make_method_summary("findById", "UserRepo", "src/UserRepo.java", "java", 1);
+        let cache_repo =
+            make_method_summary("findById", "CacheRepo", "src/CacheRepo.java", "java", 1);
+        let mut iface_marker = make_method_summary(
+            "__placeholder",
+            "Repository",
+            "src/Repository.java",
+            "java",
+            0,
+        );
+        iface_marker.hierarchy_edges = vec![
+            ("UserRepo".to_string(), "Repository".to_string()),
+            ("CacheRepo".to_string(), "Repository".to_string()),
+        ];
+        let caller = summary_with_sites(
+            "lookup",
+            "src/main.java",
+            "java",
+            0,
+            vec![CalleeSite {
+                name: "findById".into(),
+                arity: Some(1),
+                receiver: Some("r".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![user_repo, cache_repo, iface_marker, caller], None);
+        let caller_key = FuncKey::from_parts(
+            Lang::Java,
+            "src/main.java",
+            String::new(),
+            "lookup",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "Repository".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+        let caller_node = cg.index[&caller_key];
+        let targets: Vec<&FuncKey> = cg
+            .graph
+            .edges(caller_node)
+            .map(|e| &cg.graph[e.target()])
+            .collect();
+        let containers: Vec<&str> = targets.iter().map(|k| k.container.as_str()).collect();
+        assert!(
+            containers.contains(&"UserRepo") && containers.contains(&"CacheRepo"),
+            "B-2: edges must reach BOTH UserRepo::findById and CacheRepo::findById; got {targets:?}"
+        );
+        assert_eq!(targets.len(), 2, "B-2: exactly two fan-out edges expected");
+    }
+
+    /// B-3: Java extends, `Base b; b.foo()` reaches Base AND Derived
+    /// when Derived extends Base.  Pins inheritance fan-out separately
+    /// from interface implements.
+    #[test]
+    fn b3_java_extends_fans_out_to_subclass() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let base = make_method_summary("foo", "Base", "src/Base.java", "java", 0);
+        let mut derived = make_method_summary("foo", "Derived", "src/Derived.java", "java", 0);
+        derived.hierarchy_edges = vec![("Derived".to_string(), "Base".to_string())];
+        let caller = summary_with_sites(
+            "go",
+            "src/main.java",
+            "java",
+            0,
+            vec![CalleeSite {
+                name: "foo".into(),
+                arity: Some(0),
+                receiver: Some("b".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![base, derived, caller], None);
+        let caller_key = FuncKey::from_parts(
+            Lang::Java,
+            "src/main.java",
+            String::new(),
+            "go",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "Base".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+        let caller_node = cg.index[&caller_key];
+        let targets: Vec<&FuncKey> = cg
+            .graph
+            .edges(caller_node)
+            .map(|e| &cg.graph[e.target()])
+            .collect();
+        let containers: Vec<&str> = targets.iter().map(|k| k.container.as_str()).collect();
+        assert!(
+            containers.contains(&"Base"),
+            "B-3: edge must reach Base::foo; got {targets:?}"
+        );
+        assert!(
+            containers.contains(&"Derived"),
+            "B-3: edge must reach Derived::foo; got {targets:?}"
+        );
+    }
+
+    /// B-4: Rust trait dispatch, `Box<dyn Repo>; r.find(...)` reaches
+    /// every `impl Repo for X` `find`.
+    #[test]
+    fn b4_rust_trait_dispatch_fans_out_to_impls() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let user_repo = make_method_summary("find", "UserRepo", "src/user_repo.rs", "rust", 1);
+        let cache_repo = make_method_summary("find", "CacheRepo", "src/cache_repo.rs", "rust", 1);
+        let mut hierarchy_carrier = make_method_summary("__h", "Repo", "src/repo.rs", "rust", 0);
+        hierarchy_carrier.hierarchy_edges = vec![
+            ("UserRepo".to_string(), "Repo".to_string()),
+            ("CacheRepo".to_string(), "Repo".to_string()),
+        ];
+        let caller = summary_with_sites(
+            "lookup",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "find".into(),
+                arity: Some(1),
+                receiver: Some("r".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![user_repo, cache_repo, hierarchy_carrier, caller], None);
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "lookup",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "Repo".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+        let caller_node = cg.index[&caller_key];
+        let targets: Vec<&FuncKey> = cg
+            .graph
+            .edges(caller_node)
+            .map(|e| &cg.graph[e.target()])
+            .collect();
+        let containers: Vec<&str> = targets.iter().map(|k| k.container.as_str()).collect();
+        assert!(
+            containers.contains(&"UserRepo") && containers.contains(&"CacheRepo"),
+            "B-4: edges must fan out to both impls; got {targets:?}"
+        );
+    }
+
+    /// B-7: Empty hierarchy, when the typed container has no recorded
+    /// sub-types, `resolve_with_hierarchy` collapses to the direct
+    /// `ClassMethodIndex::resolve` lookup.
+    #[test]
+    fn b7_empty_hierarchy_falls_back_to_single_container() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let repo = make_method_summary("findById", "Repository", "src/repo.rs", "rust", 1);
+        let cache = make_method_summary("findById", "Cache", "src/cache.rs", "rust", 1);
+        let caller = summary_with_sites(
+            "lookup",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "findById".into(),
+                arity: Some(1),
+                receiver: Some("repo".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![repo, cache, caller], None);
+        // No hierarchy_edges set anywhere, Repository has no
+        // sub-types, so devirtualisation collapses to direct match.
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "lookup",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "Repository".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+        let caller_node = cg.index[&caller_key];
+        let targets: Vec<&FuncKey> = cg
+            .graph
+            .edges(caller_node)
+            .map(|e| &cg.graph[e.target()])
+            .collect();
+        assert_eq!(targets.len(), 1, "B-7: empty hierarchy → single edge");
+        assert_eq!(targets[0].container, "Repository");
+    }
+
+    /// B-8: Concrete sub-type, when the receiver is typed as the
+    /// concrete sub-class (not the super-type), no hierarchy
+    /// expansion fires.
+    #[test]
+    fn b8_concrete_subtype_does_not_widen() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let user_repo = make_method_summary("findById", "UserRepo", "src/user_repo.rs", "rust", 1);
+        let cache_repo =
+            make_method_summary("findById", "CacheRepo", "src/cache_repo.rs", "rust", 1);
+        let mut h = make_method_summary("__h", "Repo", "src/repo.rs", "rust", 0);
+        h.hierarchy_edges = vec![
+            ("UserRepo".to_string(), "Repo".to_string()),
+            ("CacheRepo".to_string(), "Repo".to_string()),
+        ];
+        let caller = summary_with_sites(
+            "lookup",
+            "src/main.rs",
+            "rust",
+            0,
+            vec![CalleeSite {
+                name: "findById".into(),
+                arity: Some(1),
+                receiver: Some("r".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![user_repo, cache_repo, h, caller], None);
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/main.rs",
+            String::new(),
+            "lookup",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        // Caller types the receiver as `UserRepo` (concrete).
+        // `subs_of(Lang::Rust, "UserRepo")` returns `[]` so the
+        // hierarchy expansion is a no-op and only `UserRepo::findById`
+        // is reached.
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "UserRepo".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+        let caller_node = cg.index[&caller_key];
+        let targets: Vec<&FuncKey> = cg
+            .graph
+            .edges(caller_node)
+            .map(|e| &cg.graph[e.target()])
+            .collect();
+        assert_eq!(
+            targets.len(),
+            1,
+            "B-8: concrete sub-type must not fan out; got {targets:?}"
+        );
+        assert_eq!(targets[0].container, "UserRepo");
+    }
+
+    /// B-9: Diamond, multiple impls sharing a super-type, dedup
+    /// applied per call site so each FuncKey is edged at most once.
+    #[test]
+    fn b9_diamond_dedup_one_edge_per_funckey() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let a = make_method_summary("doIt", "A", "src/A.java", "java", 0);
+        let b = make_method_summary("doIt", "B", "src/B.java", "java", 0);
+        // A and B both extend Iface in two separate file emissions ,
+        // hierarchy_edges duplicates across files; dedup expected.
+        let mut h1 = make_method_summary("__h", "Iface", "src/I1.java", "java", 0);
+        h1.hierarchy_edges = vec![
+            ("A".to_string(), "Iface".to_string()),
+            ("B".to_string(), "Iface".to_string()),
+        ];
+        let mut h2 = make_method_summary("__h2", "Iface", "src/I2.java", "java", 0);
+        h2.hierarchy_edges = vec![
+            ("A".to_string(), "Iface".to_string()),
+            ("B".to_string(), "Iface".to_string()),
+        ];
+        let caller = summary_with_sites(
+            "go",
+            "src/main.java",
+            "java",
+            0,
+            vec![CalleeSite {
+                name: "doIt".into(),
+                arity: Some(0),
+                receiver: Some("x".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![a, b, h1, h2, caller], None);
+        let caller_key = FuncKey::from_parts(
+            Lang::Java,
+            "src/main.java",
+            String::new(),
+            "go",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "Iface".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+        let caller_node = cg.index[&caller_key];
+        let targets: Vec<&FuncKey> = cg
+            .graph
+            .edges(caller_node)
+            .map(|e| &cg.graph[e.target()])
+            .collect();
+        // Each unique implementer reached at most once.
+        let containers: std::collections::HashSet<&str> =
+            targets.iter().map(|k| k.container.as_str()).collect();
+        assert_eq!(
+            containers.len(),
+            targets.len(),
+            "B-9: dedup must give one edge per FuncKey; got {targets:?}"
+        );
+        assert!(containers.contains("A") && containers.contains("B"));
+    }
+
+    /// B-13: Stale hierarchy edge, sub-type referenced by an edge
+    /// no longer has a matching FuncKey.  Resolver must not panic
+    /// and must still resolve to whatever IS present.
+    #[test]
+    fn b13_stale_subtype_no_panic() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        // `Base` exists; `Derived` referenced by hierarchy_edges but
+        // its `foo` is never defined.  Resolver must not panic and
+        // must still emit the Base::foo edge.
+        let base = make_method_summary("foo", "Base", "src/Base.java", "java", 0);
+        let mut h = make_method_summary("__h", "X", "src/X.java", "java", 0);
+        h.hierarchy_edges = vec![("Derived".to_string(), "Base".to_string())];
+        let caller = summary_with_sites(
+            "go",
+            "src/main.java",
+            "java",
+            0,
+            vec![CalleeSite {
+                name: "foo".into(),
+                arity: Some(0),
+                receiver: Some("b".into()),
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![base, h, caller], None);
+        let caller_key = FuncKey::from_parts(
+            Lang::Java,
+            "src/main.java",
+            String::new(),
+            "go",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "Base".to_string())],
+                ..Default::default()
+            },
+        );
+
+        // Build must not panic.
+        let cg = build_call_graph(&gs, &[]);
+        let caller_node = cg.index[&caller_key];
+        let targets: Vec<&FuncKey> = cg
+            .graph
+            .edges(caller_node)
+            .map(|e| &cg.graph[e.target()])
+            .collect();
+        assert!(
+            targets
+                .iter()
+                .any(|k| k.container == "Base" && k.name == "foo"),
+            "B-13: stale Derived must not block Base::foo edge; got {targets:?}"
+        );
+    }
+
+    /// Free-function calls (no receiver on the CalleeSite) must
+    /// never trigger the devirtualisation path, even if some bogus
+    /// typed_call_receivers entry happened to match the ordinal.
+    /// Regression guard: today's namespace + use-map resolution
+    /// stays in charge for free-function calls.
+    #[test]
+    fn typed_call_receivers_skips_free_function_sites() {
+        use crate::summary::ssa_summary::SsaFuncSummary;
+
+        let helper = make_summary("helper", "src/lib.rs", "rust", 0, vec![]);
+        let caller = summary_with_sites(
+            "main",
+            "src/lib.rs",
+            "rust",
+            0,
+            // No receiver on the call site → free function.
+            vec![CalleeSite {
+                name: "helper".into(),
+                arity: Some(0),
+                receiver: None,
+                ordinal: 0,
+                ..Default::default()
+            }],
+        );
+
+        let mut gs = merge_summaries(vec![helper, caller], None);
+
+        let caller_key = FuncKey::from_parts(
+            Lang::Rust,
+            "src/lib.rs",
+            String::new(),
+            "main",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        // A typed_call_receivers entry with ordinal=0, but since the
+        // site has receiver=None, this MUST be ignored.
+        gs.insert_ssa(
+            caller_key.clone(),
+            SsaFuncSummary {
+                typed_call_receivers: vec![(0, "FakeContainer".to_string())],
+                ..Default::default()
+            },
+        );
+
+        let cg = build_call_graph(&gs, &[]);
+        // Standard same-namespace resolution still finds `helper`.
+        assert_eq!(cg.graph.edge_count(), 1);
+        assert!(cg.unresolved_not_found.is_empty());
+        assert!(cg.unresolved_ambiguous.is_empty());
+    }
+
+    // ── callers_transitive + FileReachMap ───────────────────────────────
+
+    /// Three-hop chain across three files:
+    /// `routes.py::handle -> service.py::process -> helper.py::sink`
+    /// `callers_transitive(sink)` must return both `process` and `handle`.
+    /// `FileReachMap` must record `routes.py` and `service.py` as callers
+    /// of `helper.py`.
+    #[test]
+    fn callers_transitive_walks_multi_hop_chain() {
+        let handle = make_summary("handle", "routes.py", "python", 0, vec!["process"]);
+        let process = make_summary("process", "service.py", "python", 0, vec!["sink"]);
+        let sink = make_summary("sink", "helper.py", "python", 0, vec![]);
+        let gs = merge_summaries(vec![handle, process, sink], None);
+        let cg = build_call_graph(&gs, &[]);
+
+        let sink_key = FuncKey::from_parts(
+            Lang::Python,
+            "helper.py",
+            String::new(),
+            "sink",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        let transitive = callers_transitive(&cg, &sink_key);
+        let caller_names: std::collections::HashSet<String> =
+            transitive.iter().map(|k| k.name.clone()).collect();
+        assert!(
+            caller_names.contains("process"),
+            "process should reach sink"
+        );
+        assert!(caller_names.contains("handle"), "handle should reach sink");
+        assert_eq!(transitive.len(), 2, "sink itself must be excluded");
+
+        let reach = FileReachMap::build(&cg);
+        assert!(reach.reaches("routes.py", "helper.py"));
+        assert!(reach.reaches("service.py", "helper.py"));
+        assert!(reach.reaches("helper.py", "helper.py"), "self-reach");
+        assert!(!reach.reaches("helper.py", "routes.py"));
+    }
+
+    #[test]
+    fn callers_transitive_empty_for_unknown_key() {
+        let leaf = make_summary("leaf", "a.py", "python", 0, vec![]);
+        let gs = merge_summaries(vec![leaf], None);
+        let cg = build_call_graph(&gs, &[]);
+        let ghost = FuncKey::from_parts(
+            Lang::Python,
+            "nowhere.py",
+            String::new(),
+            "ghost",
+            Some(0),
+            None,
+            crate::symbol::FuncKind::Function,
+        );
+        assert!(callers_transitive(&cg, &ghost).is_empty());
+    }
+
+    #[test]
+    fn file_reach_map_handles_disconnected_components() {
+        let a_caller = make_summary("a_caller", "a.py", "python", 0, vec!["a_sink"]);
+        let a_sink = make_summary("a_sink", "a.py", "python", 0, vec![]);
+        let b_caller = make_summary("b_caller", "b.py", "python", 0, vec!["b_sink"]);
+        let b_sink = make_summary("b_sink", "b.py", "python", 0, vec![]);
+        let gs = merge_summaries(vec![a_caller, a_sink, b_caller, b_sink], None);
+        let cg = build_call_graph(&gs, &[]);
+        let reach = FileReachMap::build(&cg);
+
+        assert!(reach.reaches("a.py", "a.py"));
+        assert!(reach.reaches("b.py", "b.py"));
+        // Disconnected: a.py does not reach b.py.
+        assert!(!reach.reaches("a.py", "b.py"));
+        assert!(!reach.reaches("b.py", "a.py"));
+        assert_eq!(reach.callee_ns_len(), 2);
+    }
+
+    /// `with_scan_root` normalises absolute host paths to the
+    /// project-relative POSIX form the map keys carry, so
+    /// `reaches("/abs/scan/routes.py", "/abs/scan/helper.py")` finds
+    /// the same entry as the project-relative
+    /// `reaches("routes.py", "helper.py")` call.  Mirrors the
+    /// production wire-up in `src/commands/scan.rs`: the call-graph
+    /// uses project-relative namespaces while `Diag.path` (from
+    /// `src/ast.rs`) is the absolute walker path.
+    #[test]
+    fn file_reach_map_with_scan_root_normalises_absolute_paths() {
+        let handle = make_summary("handle", "routes.py", "python", 0, vec!["sink"]);
+        let sink = make_summary("sink", "helper.py", "python", 0, vec![]);
+        let gs = merge_summaries(vec![handle, sink], None);
+        let cg = build_call_graph(&gs, &[]);
+        let scan_root = std::path::Path::new("/abs/scan");
+        let reach = FileReachMap::build(&cg).with_scan_root(Some(scan_root));
+
+        // Mixed conventions: surface (project-relative) caller,
+        // Diag (absolute) callee.  Pre-fix this returned false.
+        assert!(reach.reaches("routes.py", "/abs/scan/helper.py"));
+        // Both absolute: also resolves.
+        assert!(reach.reaches("/abs/scan/routes.py", "/abs/scan/helper.py"));
+        // Trailing-slash root works.
+        let reach_trail =
+            FileReachMap::build(&cg).with_scan_root(Some(std::path::Path::new("/abs/scan/")));
+        assert!(reach_trail.reaches("/abs/scan/routes.py", "/abs/scan/helper.py"));
+        // Both project-relative: still resolves (legacy behaviour).
+        assert!(reach.reaches("routes.py", "helper.py"));
+        // Path outside the root falls through normalize_namespace
+        // unchanged and does not collide with a project-relative key.
+        assert!(!reach.reaches("/other/root/routes.py", "/other/root/helper.py"));
+    }
+
+    /// `with_scan_root(None)` clears a previously set root and
+    /// restores strict project-relative lookup semantics.
+    #[test]
+    fn file_reach_map_with_scan_root_none_clears_root() {
+        let handle = make_summary("handle", "routes.py", "python", 0, vec!["sink"]);
+        let sink = make_summary("sink", "helper.py", "python", 0, vec![]);
+        let gs = merge_summaries(vec![handle, sink], None);
+        let cg = build_call_graph(&gs, &[]);
+        let reach: FileReachMap = FileReachMap::build(&cg)
+            .with_scan_root(Some(std::path::Path::new("/abs/scan")))
+            .with_scan_root::<&std::path::Path>(None);
+
+        // Absolute lookup no longer resolves once root is cleared.
+        assert!(!reach.reaches("/abs/scan/routes.py", "/abs/scan/helper.py"));
+        // Project-relative still works.
+        assert!(reach.reaches("routes.py", "helper.py"));
+    }
+
+    /// Only a bare call or a call on the caller's own instance or class
+    /// can be the caller calling itself.
+    #[test]
+    fn site_may_call_self_shapes() {
+        let method = |lang, container: &str| {
+            FuncKey::from_parts(
+                lang,
+                "src/a",
+                container,
+                "find",
+                Some(1),
+                None,
+                crate::symbol::FuncKind::Method,
+            )
+        };
+        let java = method(Lang::Java, "Person");
+        for own in ["find", "this.find", "Person.find", "Person::find"] {
+            assert!(site_may_call_self(&java, own), "{own}");
+        }
+        for other in [
+            "repo.find",
+            "this.repo.find",
+            "super.find",
+            "a.b.find",
+            "x::y::find",
+        ] {
+            assert!(!site_may_call_self(&java, other), "{other}");
+        }
+        let php = method(Lang::Php, "Cache");
+        for own in ["this.find", "self.find", "static.find"] {
+            assert!(site_may_call_self(&php, own), "{own}");
+        }
+        for other in ["parent.find", "$this->inner.find"] {
+            assert!(!site_may_call_self(&php, other), "{other}");
+        }
+        let py = method(Lang::Python, "Sub");
+        assert!(site_may_call_self(&py, "self.find"));
+        assert!(site_may_call_self(&py, "cls.find"));
+        assert!(!site_may_call_self(&py, "super().find"));
+        assert!(!site_may_call_self(&py, "json.find"));
+        // Go names the method receiver freely, so a plain receiver may be
+        // the caller's own; a field chain never is.
+        let go = method(Lang::Go, "");
+        assert!(site_may_call_self(&go, "h.find"));
+        assert!(!site_may_call_self(&go, "h.mux.find"));
+    }
+}

@@ -1,0 +1,477 @@
+# CLI Reference
+
+## Global
+
+```
+nyx [COMMAND]
+nyx --version
+nyx --help
+```
+
+---
+
+## `nyx scan`
+
+Run a security scan on a directory.
+
+```
+nyx scan [PATH] [OPTIONS]
+```
+
+**PATH** defaults to `.` (current directory).
+
+### Analysis Mode
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode <MODE>` | `full` | Analysis mode: `full`, `ast`, `cfg`, or `taint` |
+
+| Mode | What runs |
+|------|-----------|
+| `full` | AST patterns + CFG structural analysis + taint analysis |
+| `ast` | AST patterns only (fastest, no CFG or taint) |
+| `cfg` / `taint` | CFG + taint analysis only (no AST patterns) |
+
+**Deprecated aliases**: `--ast-only` (use `--mode ast`), `--cfg-only` (use `--mode cfg`), `--all-targets` (use `--mode full`).
+
+### Index Control
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--index <MODE>` | `auto` | Index behavior: `auto`, `off`, or `rebuild` |
+
+| Index Mode | Behavior |
+|------------|----------|
+| `auto` | Use existing index if available; build if missing |
+| `off` | Skip indexing, scan filesystem directly |
+| `rebuild` | Force rebuild index before scanning |
+
+With the index, a rescan only re-analyses what changed. Pass 1 skips files whose bytes are unchanged, and pass 2 reuses a file's result when its bytes and every cross-file summary it looked up are unchanged. An edit that leaves a function's summary as it was re-analyses only the edited file. Set `NYX_INCREMENTAL_VERIFY=1` to re-analyse reused files anyway and log any difference from the cached result; it costs a full pass 2 and is meant for debugging. `NYX_INCREMENTAL_EXPLAIN=1` logs, for every file pass 2 analyses again, the lookups whose answers changed.
+
+**Deprecated aliases**: `--no-index` (use `--index off`), `--rebuild-index` (use `--index rebuild`).
+
+### Output
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-f, --format <FMT>` | `console` | Output format: `console`, `json`, or `sarif` |
+| `--quiet` | off | Suppress status messages (stderr), including the Preview-tier banner for C/C++ scans |
+| `--no-rank` | off | Disable attack-surface ranking |
+| `--no-state` | off | Disable state-model analysis (resource lifecycle + auth state). Overrides `scanner.enable_state_analysis` |
+
+### Profiles
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--profile <NAME>` | *(none)* | Apply a named scan profile. Built-ins: `quick`, `full`, `ci`, `taint_only`, `conservative_large_repo`. User-defined profiles override built-ins with the same name. CLI flags still take precedence over profile values |
+
+### Filtering
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--severity <EXPR>` | *(none)* | Filter findings by severity |
+| `--min-score <N>` | *(none)* | Drop findings with rank score below N |
+| `--min-confidence <LEVEL>` | *(none)* | Drop findings below this confidence level (`low`, `medium`, `high`) |
+| `--require-converged` | off | Drop findings whose engine provenance notes indicate widening (over-report) or analysis bail. Keeps `under-report` findings (emitted flow is still real). Intended for strict CI gates. |
+| `--fail-on <SEV>` | *(none)* | Exit code 1 if any finding >= this severity |
+| `--show-suppressed` | off | Show inline-suppressed findings (dimmed, tagged `[SUPPRESSED]`) |
+| `--keep-nonprod-severity` | off | Don't downgrade severity for test/vendor paths |
+| `--all` | off | Disable category filtering, rollups, and LOW budgets. Shows everything |
+| `--include-quality` | off | Include Quality-category findings (hidden by default) |
+| `--max-low <N>` | `20` | Maximum total LOW findings to show |
+| `--max-low-per-file <N>` | `1` | Maximum LOW findings per file |
+| `--max-low-per-rule <N>` | `10` | Maximum LOW findings per rule |
+| `--rollup-examples <N>` | `5` | Number of example locations in rollup findings |
+| `--show-instances <RULE>` | *(none)* | Expand all instances of a specific rule (bypass rollup) |
+
+`nyx scan` automatically reads `.nyx/triage.json` from the scan root when the
+file exists. Terminal triage states written by `nyx serve` (`false_positive`,
+`accepted_risk`, `suppressed`, and `fixed`) are hidden from CLI output and do
+not trigger `--fail-on` by default. Use `--show-suppressed` to include them in
+console, JSON, or SARIF output with their `triage_state` and optional
+`triage_note`.
+
+**Severity expression formats**:
+
+```bash
+--severity HIGH              # Only high
+--severity "HIGH,MEDIUM"     # High or medium
+--severity ">=MEDIUM"        # Medium and above (high + medium)
+--severity ">= low"         # All severities (case-insensitive)
+```
+
+**Deprecated aliases**: `--high-only` (use `--severity HIGH`), `--include-nonprod` (use `--keep-nonprod-severity`).
+
+`--fail-on` returns a non-zero exit code when the threshold trips, so CI jobs fail without further wiring:
+
+<p align="center"><img src="assets/screenshots/docs/cli-failon.png" alt="nyx scan with --fail-on HIGH against a small fixture: three HIGH taint findings printed, followed by exit=1 from the shell" width="900"/></p>
+
+Quality-category and rollup-prone Low findings are filtered down by default. The footer tells you exactly what got dropped and which knob to turn:
+
+<p align="center"><img src="assets/screenshots/docs/cli-rollup-tail.png" alt="nyx scan tail: warning '*' generated 57 issues; Suppressed 92 LOW/Quality findings; Active filters max_low=20, max_low_per_file=1, max_low_per_rule=10; Use --include-quality, --max-low, or --all to adjust" width="900"/></p>
+
+### Analysis Engine Toggles
+
+Override the corresponding `[analysis.engine]` values in `nyx.conf` for a single run.  All default **on**; pass the `--no-*` variant to disable.
+
+| Pair | Config field | Effect when disabled |
+|------|---|---|
+| `--constraint-solving` / `--no-constraint-solving` | `constraint_solving` | Skip path-constraint solving; infeasible paths no longer pruned |
+| `--abstract-interp` / `--no-abstract-interp` | `abstract_interpretation` | Skip interval / string / bit abstract domains |
+| `--context-sensitive` / `--no-context-sensitive` | `context_sensitive` | Treat intra-file callees insensitively (summary-only) |
+| `--symex` / `--no-symex` | `symex.enabled` | Skip the symex pipeline; no symbolic verdicts or witnesses |
+| `--cross-file-symex` / `--no-cross-file-symex` | `symex.cross_file` | Skip extracting / consulting cross-file SSA bodies |
+| `--symex-interproc` / `--no-symex-interproc` | `symex.interprocedural` | Cap symex frame stack at the entry function |
+| `--smt` / `--no-smt` | `symex.smt` | Skip the SMT backend (still a no-op without the `smt` feature) |
+| `--backwards-analysis` / `--no-backwards-analysis` | `backwards_analysis` | Demand-driven backwards taint walk from sinks (default **off**) |
+| `--parse-timeout-ms <N>` | `parse_timeout_ms` | Per-file tree-sitter parse timeout (ms); `0` disables the cap |
+
+### Lattice-width Caps
+
+Two caps bound the width of taint origin sets and points-to sets per SSA value. When a set would exceed the cap, entries are truncated deterministically and an engine note (`OriginsTruncated` / `PointsToTruncated`) is recorded on affected findings so you can see when precision was lost.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--max-origins <N>` | `32` | Max taint origins retained per lattice value. Raise on very wide codebases where truncation is observed; lower only when lattice width is a measured bottleneck. Also set via `NYX_MAX_ORIGINS` |
+| `--max-pointsto <N>` | `32` | Max abstract heap objects retained per points-to set. Raise on factory-heavy codebases where truncation is observed. Also set via `NYX_MAX_POINTSTO` |
+
+See [configuration.md](configuration.md#analysisengine) for the full schema.
+
+### Engine-Depth Profile
+
+Individual engine toggles are fine-grained but hard to remember in combination.  The `--engine-profile` shortcut sets the whole stack in one shot, and individual flags are layered on top after the profile is applied.
+
+| Profile | Backwards | Symex | Abstract-interp | Context-sensitive |
+|---------|-----------|-------|-----------------|-------------------|
+| `fast` | off | off | off | off |
+| `balanced` (default) | off | off | on | on |
+| `deep` | on | on (cross-file + interprocedural) | on | on |
+
+All three profiles build the AST, CFG, and SSA lattice and run forward taint; the columns above show which additional analyses each profile enables.  SMT (`symex.smt`) is always off unless Nyx was built with `--features smt`.
+
+Individual flags override the profile.  For example, `--engine-profile fast --backwards-analysis` runs the fast stack but with backwards analysis on.
+
+### Explain Effective Engine
+
+`--explain-engine` prints the resolved engine configuration (profile + config + CLI overrides + env-var fallbacks) to stdout and exits without scanning.  Useful for sanity-checking a CI invocation.
+
+```bash
+nyx scan --engine-profile deep --no-smt --explain-engine
+```
+
+<p align="center"><img src="assets/screenshots/docs/cli-explain-engine.png" alt="nyx scan --engine-profile deep --explain-engine output: resolved config showing every analysis pass, its current state, and the CLI flag/env var that controls it" width="900"/></p>
+
+### Dynamic verification
+
+Available in default builds, or in custom builds with `--features dynamic`. See [dynamic.md](dynamic.md) for the full pipeline and verdict semantics.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--verify` | on | Enable dynamic verification (default when built with `dynamic`). Conflicts with `--no-verify` |
+| `--no-verify` | off | Skip verification for this run. Useful for fast static-only scans without editing config |
+| `--verify-all-confidence` | off | Also verify findings below `Confidence >= Medium`. Slower; intended for payload tuning |
+| `--backend <BACKEND>` | `auto` | Sandbox backend: `auto` (docker if available, else process), `docker` (required), `process` (in-process runner) |
+| `--unsafe-sandbox` | off | Force the process backend. Equivalent to `--backend process`. Cannot combine with `--backend docker` |
+| `--harden <PROFILE>` | `standard` | Process-backend lockdown: `standard` (no-new-privs + rlimit on Linux) or `strict` (namespaces + chroot + seccomp on Linux; `sandbox-exec` on macOS) |
+| `--verbose` | off | Flush the per-finding `VerifyTrace` to stderr after each verdict. Same stream that lands in `expected/trace.jsonl` in the repro bundle |
+
+### Baseline / patch validation
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--baseline <FILE>` | *(none)* | Read a prior scan's JSON (or a stripped `.nyx/baseline.json`) and diff it against this scan on `stable_hash`. Reports `New` / `Resolved` / `FlippedConfirmed` / `FlippedNotConfirmed` transitions |
+| `--baseline-write <FILE>` | *(none)* | After scanning, write a stripped baseline (only `stable_hash`, `dynamic_verdict`, `severity`, `path`, `rule_id`; no source). Safe to commit |
+| `--gate <GATE>` | *(none)* | CI gate to enforce when `--baseline` is active. `no-new-confirmed` exits 2 on any new Confirmed finding; `resolve-all-confirmed` exits 2 if any baseline-Confirmed finding is not fully resolved |
+
+### Examples
+
+```bash
+# Basic scan
+nyx scan
+
+# Scan specific path, JSON output
+nyx scan ./server --format json
+
+# CI gate: fail on medium+, SARIF output
+nyx scan . --format sarif --fail-on medium > results.sarif
+
+# Fast AST-only scan, no index
+nyx scan . --mode ast --index off
+
+# High-severity only, quiet mode
+nyx scan . --severity HIGH --quiet
+
+# Only findings scoring 50 or above
+nyx scan . --min-score 50
+
+# Only medium+ confidence findings
+nyx scan . --min-confidence medium
+
+# Show everything (no filtering, no rollups)
+nyx scan . --all
+
+# Include quality findings but keep rollups and budgets
+nyx scan . --include-quality
+
+# See all unwrap findings expanded
+nyx scan . --include-quality --show-instances rs.quality.unwrap
+
+# Allow more LOW findings
+nyx scan . --max-low 50 --max-low-per-file 5
+```
+
+---
+
+## `nyx repro`
+
+Replay a dynamic repro bundle for a confirmed finding.
+
+```
+nyx repro (--finding <ID> | --spec-hash <HASH> | --bundle <DIR>) [OPTIONS]
+```
+
+Nyx writes repro bundles under the platform cache directory and keys them by
+`spec_hash`. The browser UI and scan output show `finding_id`, so
+`--finding` scans cached bundle manifests and replays the newest match.
+
+| Flag | Description |
+|------|-------------|
+| `--finding <ID>` | Find the newest cached bundle whose manifest carries this stable finding ID |
+| `--spec-hash <HASH>` | Replay an exact cache bundle by spec hash |
+| `--bundle <DIR>` | Replay an explicit bundle directory |
+| `--docker` | Run the bundle's Docker replay path (`./reproduce.sh --docker`) |
+| `--print-path` | Print the resolved bundle path and exit without replaying |
+| `--list` | With `--finding`, list all matching cached bundles newest first |
+
+Examples:
+
+```bash
+nyx repro --finding b9caa35df2213040
+nyx repro --finding b9caa35df2213040 --docker
+nyx repro --finding b9caa35df2213040 --print-path
+nyx repro --spec-hash 8bca7f8e0311d6c9
+nyx repro --bundle /path/to/repro/8bca7f8e0311d6c9
+```
+
+Exit codes mirror `reproduce.sh`: `0` pass, `1` replay mismatch, `2` Docker
+unavailable, `3` process-backend toolchain mismatch. Any other script exit is
+passed through.
+
+---
+
+## `nyx index`
+
+Manage the SQLite file index.
+
+### `nyx index build`
+
+```
+nyx index build [PATH] [--force]
+```
+
+Build or update the index for the given path (default: `.`).
+
+| Flag | Description |
+|------|-------------|
+| `-f, --force` | Force full rebuild, ignoring cached file hashes |
+
+### `nyx index status`
+
+```
+nyx index status [PATH]
+```
+
+Display index statistics (file count, size, last modified) for the given path.
+
+<p align="center"><img src="assets/screenshots/docs/cli-idxstatus.png" alt="nyx index status output: project name, index path under the platform config dir, exists/size/modified fields" width="900"/></p>
+
+---
+
+## `nyx list`
+
+```
+nyx list [-v]
+```
+
+List all indexed projects.
+
+| Flag | Description |
+|------|-------------|
+| `-v, --verbose` | Show detailed information per project |
+
+---
+
+## `nyx clean`
+
+```
+nyx clean [PROJECT] [--all]
+```
+
+Remove index data.
+
+| Argument/Flag | Description |
+|---------------|-------------|
+| `PROJECT` | Project name or path to clean |
+| `--all` | Clean all indexed projects |
+
+---
+
+## `nyx surface`
+
+Print the project's attack-surface map.
+
+```
+nyx surface [PATH] [--format <FMT>] [--build]
+```
+
+Loads the `SurfaceMap` persisted by the most recent indexed scan when available; otherwise runs the per-language framework probes against the on-disk source to produce an entry-points-only map. Pass `--build` to force a full inline build (pass-1 summary extraction + call-graph construction) on an unscanned project, which adds `DataStore` / `ExternalService` / `DangerousLocal` nodes the entry-points-only fallback omits.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--format <FMT>` | `text` | Output format: `text` (indented tree), `json` (canonical SurfaceMap), `dot` (Graphviz source), or `svg` (spawns `dot` locally) |
+| `--build` | off | Force a full SurfaceMap build inline when no indexed scan exists. Same cost as `nyx index build` |
+
+Pipe `dot` output through `dot -Tsvg` for a renderable graph, or use `--format svg` for a one-step render when graphviz is installed.
+
+---
+
+## `nyx serve`
+
+Start the local browser UI for browsing scan results.
+
+```
+nyx serve [PATH] [OPTIONS]
+```
+
+**PATH** defaults to `.` (current directory). The server binds to a loopback address only and refuses non-loopback hosts at startup.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-p, --port <PORT>` | *(from config)* | Port to bind to (overrides `[server].port`) |
+| `--host <HOST>` | *(from config)* | Host to bind to (overrides `[server].host`) |
+| `--no-browser` | off | Skip opening the browser automatically |
+
+See [serve.md](serve.md) for the UI tour, route map, and CSRF / host-header behaviour.
+
+---
+
+## `nyx verify-feedback`
+
+Record a correction or confirmation against a dynamic-verifier verdict. Requires `--features dynamic`.
+
+```
+nyx verify-feedback <FINDING_ID> [--wrong <REASON> | --right] [--upload]
+```
+
+| Argument/Flag | Description |
+|---------------|-------------|
+| `FINDING_ID` | Stable 16-char hex id shown in `nyx scan --verify` output |
+| `--wrong <REASON>` | Mark the verdict wrong and record the reason. Conflicts with `--right` |
+| `--right` | Confirm the verdict. Conflicts with `--wrong` |
+| `--upload` | Reserved; uploading to Nyx telemetry is not yet implemented |
+
+Feedback is written to the local telemetry log under the platform cache dir.
+
+---
+
+## `nyx config`
+
+Manage configuration.
+
+### `nyx config show`
+
+Print the effective merged configuration as TOML. Useful for sanity-checking what the scanner is actually using after `nyx.conf` and `nyx.local` merge:
+
+<p align="center"><img src="assets/screenshots/docs/cli-configshow.png" alt="nyx config show output: TOML dump of the merged scanner config showing [scanner] mode/min_severity/excluded_extensions/excluded_directories, [database] settings, and resolved engine toggles" width="900"/></p>
+
+### `nyx config path`
+
+Print the configuration directory path.
+
+### `nyx config add-rule`
+
+```
+nyx config add-rule --lang <LANG> --matcher <MATCHER> --kind <KIND> --cap <CAP>
+```
+
+Add a custom taint rule. Written to `nyx.local`.
+
+| Flag | Values |
+|------|--------|
+| `--lang` | `rust`, `javascript`, `typescript`, `python`, `go`, `java`, `c`, `cpp`, `php`, `ruby` |
+| `--matcher` | Function or property name to match |
+| `--kind` | `source`, `sanitizer`, `sink` |
+| `--cap` | `env_var`, `html_escape`, `shell_escape`, `url_encode`, `json_parse`, `file_io`, `fmt_string`, `sql_query`, `deserialize`, `ssrf`, `code_exec`, `crypto`, `unauthorized_id`, `data_exfil`, `ldap_injection`, `xpath_injection`, `header_injection`, `open_redirect`, `ssti`, `xxe`, `prototype_pollution`, `all` |
+
+### `nyx config add-terminator`
+
+```
+nyx config add-terminator --lang <LANG> --name <NAME>
+```
+
+Add a terminator function (e.g. `process.exit`). Written to `nyx.local`.
+
+---
+
+## `nyx rules`
+
+Browse the built-in rule registry from the terminal. Same dataset the dashboard's Rules page reads from: cap-class entries (one per `Cap` with a canonical rule id), per-language label rules (sink / source / sanitizer), gated sinks, and any custom rules from your config.
+
+### `nyx rules list`
+
+```
+nyx rules list [--lang <SLUG>] [--kind <KIND>] [--class-only|--no-class] [--json]
+```
+
+| Flag | Values |
+|------|--------|
+| `--lang` | Language slug (`javascript`, `typescript`, `python`, `java`, `php`, `go`, `ruby`, `rust`, `c`, `cpp`). Cap-class entries (`language = "all"`) still surface alongside any language filter unless `--no-class` is set. |
+| `--kind` | `class` (cap-class entry), `source`, `sink`, `sanitizer` |
+| `--class-only` | Show only the cap-class registry entries, suppressing per-language label rules and gated sinks. |
+| `--no-class` | Suppress cap-class registry entries, show only per-language label rules and gated sinks. Conflicts with `--class-only`. |
+| `--json` | Emit JSON instead of the human-readable table. Schema matches the `/api/rules` response. |
+
+Examples:
+
+```bash
+# Browse the seven new vulnerability classes
+nyx rules list --class-only
+
+# All Java sinks
+nyx rules list --lang java --kind sink
+
+# JSON output for scripted filtering
+nyx rules list --json | jq '.[] | select(.cap == "ldap_injection")'
+```
+
+The `enabled` column reflects the `analysis.disabled_rules` overlay from your config, so a rule disabled in `nyx.local` shows up here too. Custom rules added via `nyx config add-rule` appear at the end with `is_custom: true`.
+
+---
+
+## Exit codes
+
+See [output.md](output.md#exit-codes). Summary: `0` on success (including findings without `--fail-on`), `1` when `--fail-on` trips, non-zero on scan errors.
+
+---
+
+## Environment variables
+
+Runtime behaviour:
+
+| Variable | Description |
+|----------|-------------|
+| `RUST_LOG` | Set tracing verbosity (e.g. `RUST_LOG=debug nyx scan .`) |
+| `NO_COLOR` | Disable ANSI color output |
+
+Engine toggles (legacy, still honored; prefer CLI flags or `[analysis.engine]` config):
+
+| Variable | Matches |
+|---|---|
+| `NYX_CONSTRAINT` | `--constraint-solving` |
+| `NYX_ABSTRACT_INTERP` | `--abstract-interp` |
+| `NYX_CONTEXT_SENSITIVE` | `--context-sensitive` |
+| `NYX_SYMEX`, `NYX_CROSS_FILE_SYMEX`, `NYX_SYMEX_INTERPROC` | `--symex` and friends |
+| `NYX_SMT` | `--smt` (no-op without the `smt` feature) |
+| `NYX_BACKWARDS` | `--backwards-analysis` |
+| `NYX_PARSE_TIMEOUT_MS` | `--parse-timeout-ms` |
+| `NYX_MAX_ORIGINS`, `NYX_MAX_POINTSTO` | `--max-origins`, `--max-pointsto` |

@@ -1,0 +1,72 @@
+{
+  "description": "eval() with user-controlled input from req.query. AST pattern detects eval call; taint detects source-to-sink flow.",
+  "tags": [
+    "taint",
+    "code-exec",
+    "eval",
+    "express"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "js.code_exec.eval",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        4,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "AST pattern matches eval() call regardless of arguments"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        3,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "req.query.expr flows directly into eval() which is a SHELL_ESCAPE sink"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "HIGH",
+      "must_match": false,
+      "line_range": [
+        7,
+        7
+      ],
+      "evidence_contains": [],
+      "notes": "noise: req.query.expr flows to res.json, which is not an XSS sink; returning the computed result is standard API behavior"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "HIGH",
+      "must_not_match": true,
+      "line_range": [
+        16,
+        16
+      ],
+      "evidence_contains": [],
+      "notes": "res.json sends application/json and is not modelled as an XSS sink, so the parseFloat-validated result reports no flow; the /calc handler's expr must not leak into it through the top-level seed"
+    },
+    {
+      "rule_id": "cfg-unguarded-sink",
+      "severity": "MEDIUM",
+      "must_match": false,
+      "line_range": [
+        4,
+        4
+      ],
+      "evidence_contains": [],
+      "notes": "structural: cfg-unguarded-sink on high-risk sink at line 4 — taint active but no confirmed flow"
+    }
+  ]
+}

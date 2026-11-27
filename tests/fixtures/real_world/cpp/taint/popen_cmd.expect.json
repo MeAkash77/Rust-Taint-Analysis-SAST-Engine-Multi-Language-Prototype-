@@ -1,0 +1,34 @@
+{
+  "description": "Command injection via popen: user input concatenated into shell command string",
+  "tags": [
+    "taint",
+    "cmdi"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "cpp.cmdi.popen",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        5,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "popen executes command string built from user input via string concatenation"
+    },
+    {
+      "rule_id": "cfg-unguarded-sink",
+      "severity": "MEDIUM",
+      "must_match": false,
+      "line_range": [
+        7,
+        7
+      ],
+      "evidence_contains": [],
+      "notes": "structural: cfg-unguarded-sink on high-risk sink at line 7 \u2014 taint active but no confirmed flow"
+    }
+  ]
+}

@@ -1,0 +1,457 @@
+//! CFG structural analysis: dominator-based checks over intra-procedural CFGs.
+//!
+//! Checks structural properties that the taint engine cannot: whether sinks are
+//! guarded by sanitizers or validators, whether web handlers reach privileged
+//! sinks without an auth call, whether resources are released on all exit paths,
+//! and whether error paths terminate before reaching dangerous code.
+//!
+//! A guard dominates a sink when the guard must execute before the sink on
+//! every path from function entry.
+//!
+//! # Rule IDs
+//!
+//! | Rule ID | Severity | What it checks |
+//! |---------|----------|----------------|
+//! | `cfg-unguarded-sink` | High/Medium | Sink reachable from entry without a matching guard |
+//! | `cfg-auth-gap` | High | Web handler reaches privileged sink with no auth call |
+//! | `cfg-unreachable-sink` | Medium | Sink in dead code |
+//! | `cfg-unreachable-sanitizer` | Low | Sanitizer in dead code (may have been silently disabled) |
+//! | `cfg-unreachable-source` | Low | Source in dead code |
+//! | `cfg-error-fallthrough` | High/Medium | Error path does not terminate before a dangerous call |
+//! | `cfg-resource-leak` | Medium | Resource acquired but not released on all exit paths |
+//! | `cfg-lock-not-released` | Medium | Lock acquired but not released on all exit paths |
+//!
+//! # Recognised guards
+//!
+//! `validate*`, `sanitize*`, `check_*`, `verify_*`, `assert_*`,
+//! `shell_escape`, `html_escape`, `url_encode`, `which`.
+//!
+//! # Recognised auth names
+//!
+//! `is_authenticated`, `require_auth`, `check_permission`, `authorize`,
+//! `authenticate`, `require_login`, `check_auth`, `verify_token`,
+//! `validate_token` (cross-language), plus `isAuthenticated`,
+//! `checkPermission`, `hasAuthority`, `hasRole` (Java) and
+//! `middleware.auth`, `auth.required` (Go).
+//!
+//! Custom guards and auth functions can be added as `sanitizer` rules
+//! with `cap = "all"` in `nyx.conf`.
+//!
+//! # Submodules
+//!
+//! - [`auth`]: auth-gap detection, handler classification
+//! - [`dominators`]: dominator tree computation over CFG nodes
+//! - [`error_handling`]: error-fallthrough detection
+//! - [`guards`]: guard recognition and dominator queries
+//! - [`resources`]: resource-leak and lock-not-released detection
+//! - [`rules`]: finding construction and rule ID assignment
+
+pub mod auth;
+pub mod dominators;
+pub mod error_handling;
+pub mod guards;
+pub mod resources;
+pub mod rules;
+pub mod scoring;
+#[cfg(test)]
+mod tests;
+pub mod unreachable;
+
+use crate::cfg::{FuncSummaries, NodeInfo, StmtKind};
+use crate::labels::{DataLabel, LangAnalysisRules};
+use crate::patterns::Severity;
+use crate::ssa::SsaBody;
+use crate::ssa::const_prop::ConstValues;
+use crate::ssa::type_facts::TypeFactResult;
+use crate::summary::GlobalSummaries;
+use crate::symbol::Lang;
+use crate::taint;
+use petgraph::graph::NodeIndex;
+use std::collections::HashSet;
+
+/// Per-body SSA facts used by structural analyses for finer-grained
+/// constancy checks.  Produced once per body in `run_cfg_analyses` and
+/// passed via `AnalysisContext::body_const_facts`.
+pub struct BodyConstFacts {
+    pub ssa: SsaBody,
+    pub const_values: ConstValues,
+    pub type_facts: TypeFactResult,
+    /// Field-sensitive Steensgaard points-to facts.
+    ///
+    /// Computed only when [`crate::pointer::is_enabled()`].
+    /// `state::transfer.rs` consumes this to suppress proxy-acquire
+    /// mis-attribution on field-aliased locals like `m := c.mu`. When
+    /// `None`, consumers fall back to pointer-unaware behaviour.
+    pub pointer_facts: Option<crate::pointer::PointsToFacts>,
+}
+
+/// Lower a body to SSA and run constant propagation.  Returns `None` when
+/// lowering fails (empty CFG, invalid entry), callers treat absence as
+/// "no SSA facts available" and fall back to the syntactic path.
+/// Perf-regression sentinel: total cumulative calls to
+/// [`build_body_const_facts`] across the process lifetime.
+///
+/// Used by the `analyse_file_fused_large_go` criterion bench in
+/// `benches/scan_bench.rs` to assert the per-file
+/// [`crate::ast`]`::ParsedFile::body_const_facts_cache` is collapsing the
+/// per-body re-lowering (~149 calls per file expected; pre-cache was ~447).
+/// The atomic increment is ~1 ns per call and disappears in the noise of
+/// the multi-millisecond SSA lowering it gates.
+#[doc(hidden)]
+pub static BUILD_BODY_CONST_FACTS_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub fn build_body_const_facts(body: &crate::cfg::BodyCfg, lang: Lang) -> Option<BodyConstFacts> {
+    BUILD_BODY_CONST_FACTS_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut ssa = crate::ssa::lower_to_ssa_with_params(
+        &body.graph,
+        body.entry,
+        body.meta.name.as_deref(),
+        body.meta.parent_body_id.is_none(),
+        &body.meta.params,
+    )
+    .ok()?;
+    let opt = crate::ssa::optimize_ssa_with_param_types(
+        &mut ssa,
+        &body.graph,
+        Some(lang),
+        &body.meta.param_types,
+    );
+    let pointer_facts = if crate::pointer::is_enabled() {
+        Some(crate::pointer::analyse_body(&ssa, body.meta.id))
+    } else {
+        None
+    };
+    Some(BodyConstFacts {
+        ssa,
+        const_values: opt.const_values,
+        type_facts: opt.type_facts,
+        pointer_facts,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Confidence {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Debug, Clone)]
+pub struct CfgFinding {
+    pub rule_id: String,
+    pub severity: Severity,
+    pub confidence: Confidence,
+    pub span: (usize, usize),
+    pub message: String,
+    pub evidence: Vec<NodeIndex>,
+    pub score: Option<f64>,
+}
+
+pub struct AnalysisContext<'a> {
+    pub cfg: &'a crate::cfg::Cfg,
+    pub entry: NodeIndex,
+    pub lang: Lang,
+    pub source_bytes: &'a [u8],
+    pub func_summaries: &'a FuncSummaries,
+    pub global_summaries: Option<&'a GlobalSummaries>,
+    /// Per-file SSA summaries map produced by
+    /// `lower_all_functions_from_bodies` (after both the augment pass
+    /// and the rerun-with-augmented-summaries pass).  Carries the
+    /// final validated_params_to_return / param_to_sink merges that
+    /// the snapshot in `global_summaries` may not yet reflect on
+    /// single-file scans.  Used by the unguarded-sink analysis to
+    /// suppress structural findings whose taint flow has been proven
+    /// validated through helper summaries (CVE-2026-25544 patched
+    /// counterpart).
+    pub ssa_summaries: Option<
+        &'a std::collections::HashMap<
+            crate::symbol::FuncKey,
+            crate::summary::ssa_summary::SsaFuncSummary,
+        >,
+    >,
+    pub taint_findings: &'a [taint::Finding],
+    pub analysis_rules: Option<&'a LangAnalysisRules>,
+    /// Whether full taint analysis was active for this file (global summaries
+    /// existed and taint engine ran).  When false, structural findings without
+    /// taint confirmation should be treated with lower confidence.
+    pub taint_active: bool,
+    /// Optional per-body SSA + constant-propagation facts.  When present,
+    /// structural analyses can use SSA const-prop to prove that all argument
+    /// flows into a sink resolve to literal constants, suppressing false
+    /// positives that the one-hop CFG trace alone cannot.
+    pub body_const_facts: Option<&'a BodyConstFacts>,
+    /// Optional per-body type-fact result produced by `optimize_ssa`.
+    /// Structural analyses use it to suppress findings when a sink's argument
+    /// SSA values are proven to carry non-injectable types (e.g. integers
+    /// parsed from a raw source can't form SHELL/SQL/path payloads).  Sourced
+    /// from `body_const_facts` when present, keep both pointers coherent.
+    pub type_facts: Option<&'a TypeFactResult>,
+    /// Decorators / annotations / attributes attached to the body's
+    /// declaration (e.g. Python `@login_required`, Java `@PreAuthorize`,
+    /// Symfony `#[IsGranted(...)]`).  Consumed by the AuthGap analysis to
+    /// suppress `cfg-auth-gap` when the framework already enforces auth at
+    /// the function-declaration level, the gap only matters when the
+    /// auth call has to live inside the body.
+    pub auth_decorators: &'a [String],
+    /// Names of variables whose `.close()` / release calls live in a
+    /// nested closure body somewhere else in the file (e.g.
+    /// `socket.on("close", () => ws.close())`).  ResourceMisuse uses this
+    /// to suppress `cfg-resource-leak` for handles whose cleanup happens
+    /// in a callback the per-body CFG can't observe.  When `None`, no
+    /// closure-based suppression is applied.
+    pub closure_released_var_names: Option<&'a std::collections::HashSet<String>>,
+    /// Class-level constant scalars discovered for this file, keyed by
+    /// the unqualified field name (Java `static final TYPE NAME = LIT;`).
+    /// Used by `cfg_analysis::guards` to treat identifiers referencing
+    /// these fields as compile-time constants for the
+    /// `cfg-unguarded-sink` all-args-constant check.  `None` outside Java
+    /// and on call sites that have not threaded the map through.
+    pub class_constant_scalars: Option<&'a std::collections::HashMap<String, String>>,
+    /// Parameters declared by the body under analysis.
+    pub body_params: &'a [String],
+    /// Parameters of the enclosing function bodies (never the top level)
+    /// that a closure, block or nested function can read.  Empty for
+    /// top-level functions and methods.
+    pub captured_params: &'a [String],
+    /// File-scope names bound once to a literal (see
+    /// [`module_constant_names`]).  A use of one of these names in a body
+    /// that neither assigns it nor takes it as a parameter is a constant.
+    /// `None` on call sites that have not threaded the set through.
+    pub module_constants: Option<&'a HashSet<String>>,
+    /// File-scope names bound once to a literal collection of scalars and
+    /// read only as the iterable of a loop (see
+    /// [`module_constant_collection_names`]).  The binder of such a loop is a
+    /// constant.  `None` on call sites that have not threaded the set through.
+    pub module_constant_collections: Option<&'a HashSet<String>>,
+}
+
+/// Names bound once, at file scope, to a literal: `const FIND_USER = 'SELECT
+/// ..'` in JS, `QUERY = """.."""` in Python, a Go package `const`.  The
+/// per-body analyses cannot see these bindings.  A name assigned anywhere
+/// else in the file (a second top-level assignment, or any function body)
+/// is left out, so a value that changes at run time never counts.
+pub fn module_constant_names(bodies: &[crate::cfg::BodyCfg]) -> HashSet<String> {
+    let Some(top) = bodies
+        .iter()
+        .find(|b| b.meta.kind == crate::cfg::BodyKind::TopLevel)
+    else {
+        return HashSet::new();
+    };
+    let mut def_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for body in bodies {
+        for info in body.graph.node_weights() {
+            for d in info.taint.defines.iter().chain(&info.taint.extra_defines) {
+                *def_counts.entry(d.as_str()).or_default() += 1;
+            }
+        }
+    }
+    top.graph
+        .node_weights()
+        .filter_map(|info| {
+            let d = info.taint.defines.as_deref()?;
+            let literal = info.taint.const_text.is_some()
+                && info.taint.uses.is_empty()
+                && info.taint.labels.is_empty();
+            (literal && def_counts.get(d) == Some(&1)).then(|| d.to_string())
+        })
+        .collect()
+}
+
+/// Names bound once, at file scope, to a literal collection of scalars
+/// (`const NAMES = ["a", "b"]`) that nothing else in the file touches.  The CFG
+/// builder clears `const_collection` unless every mention of the name is its
+/// declaration or a loop iterable, so the collection cannot be mutated, aliased
+/// or passed on and a loop variable over it only takes the literal elements.
+pub fn module_constant_collection_names(bodies: &[crate::cfg::BodyCfg]) -> HashSet<String> {
+    let Some(top) = bodies
+        .iter()
+        .find(|b| b.meta.kind == crate::cfg::BodyKind::TopLevel)
+    else {
+        return HashSet::new();
+    };
+    let mut candidates: HashSet<&str> = top
+        .graph
+        .node_weights()
+        .filter(|i| i.taint.const_collection)
+        .filter_map(|i| i.taint.defines.as_deref())
+        .collect();
+    if candidates.is_empty() {
+        return HashSet::new();
+    }
+    let mut def_counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for body in bodies {
+        for info in body.graph.node_weights() {
+            for d in info.taint.defines.iter().chain(&info.taint.extra_defines) {
+                *def_counts.entry(d.as_str()).or_default() += 1;
+            }
+        }
+    }
+    candidates.retain(|c| def_counts.get(c) == Some(&1));
+    candidates.into_iter().map(str::to_string).collect()
+}
+
+impl<'a> AnalysisContext<'a> {
+    /// Parameter names in scope for the body under analysis: its own, then
+    /// the ones it captures from enclosing functions.
+    ///
+    /// `func_summaries` cannot answer this: it covers the whole file, and a
+    /// summary's `entry` indexes its own body's graph, not `self.cfg`.
+    pub fn scope_param_names(&self) -> impl Iterator<Item = &'a str> + use<'a> {
+        let (own, captured) = (self.body_params, self.captured_params);
+        own.iter().chain(captured).map(String::as_str)
+    }
+}
+
+pub trait CfgAnalysis {
+    fn run(&self, ctx: &AnalysisContext) -> Vec<CfgFinding>;
+}
+
+/// Run all registered analyses and return merged findings.
+pub fn run_all(ctx: &AnalysisContext) -> Vec<CfgFinding> {
+    let analyses: Vec<Box<dyn CfgAnalysis>> = vec![
+        Box::new(unreachable::UnreachableCode),
+        Box::new(guards::UnguardedSink),
+        Box::new(auth::AuthGap),
+        Box::new(error_handling::IncompleteErrorHandling),
+        Box::new(resources::ResourceMisuse),
+    ];
+    let mut findings: Vec<CfgFinding> = analyses.iter().flat_map(|a| a.run(ctx)).collect();
+
+    // ── Dedup: suppress cfg-unguarded-sink when taint already covers the span ──
+    // Collect spans where taint findings exist (sink byte offset).
+    let taint_spans: HashSet<(usize, usize)> = ctx
+        .taint_findings
+        .iter()
+        .map(|f| ctx.cfg[f.sink].ast.span)
+        .collect();
+
+    findings.retain(|f| {
+        // If both taint and cfg-unguarded-sink fire on the same span,
+        // suppress the structural CFG finding (taint is the primary signal).
+        !(f.rule_id == "cfg-unguarded-sink" && taint_spans.contains(&f.span))
+    });
+
+    // ── Dedup: suppress cfg-unguarded-sink when cfg-unreachable-sink covers the span ──
+    let unreachable_spans: HashSet<(usize, usize)> = findings
+        .iter()
+        .filter(|f| f.rule_id == "cfg-unreachable-sink")
+        .map(|f| f.span)
+        .collect();
+
+    findings
+        .retain(|f| !(f.rule_id == "cfg-unguarded-sink" && unreachable_spans.contains(&f.span)));
+
+    scoring::score_findings(&mut findings, ctx);
+    findings.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    findings
+}
+
+/// Helper: check whether a node is a guard call (validate, sanitize, check, etc.).
+pub(crate) fn is_guard_call(
+    info: &NodeInfo,
+    lang: Lang,
+    analysis_rules: Option<&LangAnalysisRules>,
+) -> bool {
+    if info.kind != StmtKind::Call {
+        return false;
+    }
+    if let Some(callee) = &info.call.callee {
+        // Check config sanitizer rules
+        if let Some(extras) = analysis_rules {
+            let callee_lower = callee.to_ascii_lowercase();
+            for rule in &extras.extra_labels {
+                if !matches!(rule.label, DataLabel::Sanitizer(_)) {
+                    continue;
+                }
+                for m in &rule.matchers {
+                    let ml = m.to_ascii_lowercase();
+                    if ml.ends_with('_') {
+                        if callee_lower.starts_with(&ml) {
+                            return true;
+                        }
+                    } else if guards::suffix_matches_at_leaf_boundary(&callee_lower, &ml) {
+                        // Leaf-boundary match, not a bare `ends_with`: otherwise
+                        // `invalidate` matches the `validate` guard and `unquote`
+                        // matches `quote`, registering cache-invalidation /
+                        // URL-decode calls as guards and suppressing real sinks.
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // Check built-in guard rules
+        let guard_rules = rules::guard_rules(lang);
+        let callee_lower = callee.to_ascii_lowercase();
+        for rule in guard_rules {
+            for &m in rule.matchers {
+                let ml = m.to_ascii_lowercase();
+                if ml.ends_with('_') {
+                    if callee_lower.starts_with(&ml) {
+                        return true;
+                    }
+                } else if guards::suffix_matches_at_leaf_boundary(&callee_lower, &ml) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Helper: check whether a node is an auth check call.
+pub(crate) fn is_auth_call(info: &NodeInfo, lang: Lang) -> bool {
+    if info.kind != StmtKind::Call {
+        return false;
+    }
+    if let Some(callee) = &info.call.callee {
+        let auth_rules = rules::auth_rules(lang);
+        let callee_lower = callee.to_ascii_lowercase();
+        for rule in auth_rules {
+            for &m in rule.matchers {
+                let ml = m.to_ascii_lowercase();
+                if ml.ends_with('_') {
+                    if callee_lower.starts_with(&ml) {
+                        return true;
+                    }
+                } else if callee_lower.ends_with(&ml) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Helper: check if a function name looks like an entry point (HTTP handler, main, etc.).
+pub(crate) fn is_entry_point_func(func_name: &str, lang: Lang) -> bool {
+    let ep_rules = rules::entry_point_rules(lang);
+    let name_lower = func_name.to_ascii_lowercase();
+    for rule in ep_rules {
+        for &m in rule.matchers {
+            let ml = m.to_ascii_lowercase();
+            if ml.ends_with('*') {
+                let prefix = &ml[..ml.len() - 1];
+                if name_lower.starts_with(prefix) {
+                    return true;
+                }
+            } else if name_lower == ml {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Helper: check if a node is a sink.
+pub(crate) fn is_sink(info: &NodeInfo) -> bool {
+    info.taint
+        .labels
+        .iter()
+        .any(|l| matches!(l, DataLabel::Sink(_)))
+}

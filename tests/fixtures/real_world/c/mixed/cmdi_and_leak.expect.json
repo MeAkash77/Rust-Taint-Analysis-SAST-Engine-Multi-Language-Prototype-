@@ -1,0 +1,71 @@
+{
+  "description": "Command injection via popen with sprintf, plus missing pclose resource leak",
+  "tags": [
+    "cmdi",
+    "state",
+    "mixed"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "c.cmdi.popen",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        5,
+        9
+      ],
+      "evidence_contains": [],
+      "notes": "popen executes shell command built from user input"
+    },
+    {
+      "rule_id": "c.memory.sprintf",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        4,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "sprintf used to build command — buffer overflow risk"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        9,
+        11
+      ],
+      "evidence_contains": [],
+      "notes": "fgets reads from popen handle opened on a tainted command; printf(buf) echoes the tainted shell output — secondary XSS-style flow"
+    },
+    {
+      "rule_id": "state-resource-leak",
+      "severity": null,
+      "must_match": false,
+      "line_range": [
+        5,
+        13
+      ],
+      "evidence_contains": [],
+      "notes": "popen at line 7 never pclose'd — aspirational state finding"
+    },
+    {
+      "rule_id": "cfg-unguarded-sink",
+      "severity": "MEDIUM",
+      "must_match": false,
+      "line_range": [
+        7,
+        7
+      ],
+      "evidence_contains": [],
+      "notes": "structural: cfg-unguarded-sink on high-risk sink at line 7 — taint active but no confirmed flow"
+    }
+  ]
+}

@@ -1,0 +1,70 @@
+{
+  "description": "Classic C buffer overflow patterns: strcpy, gets, strcat without bounds checking",
+  "tags": [
+    "mem",
+    "buffer-overflow"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "c.memory.strcpy",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        4,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "strcpy without bounds check — potential buffer overflow"
+    },
+    {
+      "rule_id": "c.memory.gets",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        17,
+        21
+      ],
+      "evidence_contains": [],
+      "notes": "gets() is always unsafe — no way to limit input length"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        19,
+        21
+      ],
+      "evidence_contains": [],
+      "notes": "gets(buf) is a tainted input source; printf(buf) at line 20 is an output sink — scanner reports the unbounded-input-to-output flow"
+    },
+    {
+      "rule_id": "c.memory.strcpy",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        23,
+        27
+      ],
+      "evidence_contains": [],
+      "notes": "strcpy in concat_vuln — first unbounded copy"
+    },
+    {
+      "rule_id": "c.memory.strcat",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        24,
+        28
+      ],
+      "evidence_contains": [],
+      "notes": "strcat without bounds check — appends without size limit"
+    }
+  ]
+}

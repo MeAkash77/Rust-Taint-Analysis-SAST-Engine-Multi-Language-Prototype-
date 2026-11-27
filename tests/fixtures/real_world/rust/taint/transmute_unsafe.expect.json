@@ -1,0 +1,45 @@
+{
+  "description": "Unsafe Rust: mem::transmute for type punning and raw pointer manipulation",
+  "tags": [
+    "unsafe",
+    "mem"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "rs.memory.transmute",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        9,
+        13
+      ],
+      "evidence_contains": [],
+      "notes": "mem::transmute used for u32 to [u8; 4] conversion"
+    },
+    {
+      "rule_id": "rs.quality.unsafe_block",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        9,
+        13
+      ],
+      "evidence_contains": [],
+      "notes": "unsafe block wrapping mem::transmute call"
+    },
+    {
+      "rule_id": "rs.quality.unsafe_fn",
+      "severity": "MEDIUM",
+      "must_match": true,
+      "line_range": [
+        3,
+        3
+      ],
+      "evidence_contains": [],
+      "notes": "TP: unsafe fn reinterpret declaration correctly flagged by AST quality rule"
+    }
+  ]
+}

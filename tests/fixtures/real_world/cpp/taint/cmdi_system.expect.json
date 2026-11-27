@@ -1,0 +1,60 @@
+{
+  "description": "C++ command injection: std::getenv flows to system(). Safe version uses allowlist.",
+  "tags": [
+    "taint",
+    "cmdi"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "cpp.cmdi.system",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        4,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "system(cmd) where cmd comes from std::getenv"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        3,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "std::getenv flows directly to system() without sanitization"
+    },
+    {
+      "rule_id": "cpp.cmdi.system",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        12,
+        16
+      ],
+      "evidence_contains": [],
+      "notes": "AST pattern still matches system() in safe version"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "HIGH",
+      "must_match": true,
+      "max_count": 1,
+      "line_range": [
+        14,
+        14
+      ],
+      "evidence_contains": [],
+      "notes": "std::getenv at line 10 flows to system(cmd) at line 14 in execute_safe — allowlist check uses string copy but original cmd pointer still reaches sink. Exactly one finding after dedup; second cross-function leak collapses into this one."
+    }
+  ]
+}

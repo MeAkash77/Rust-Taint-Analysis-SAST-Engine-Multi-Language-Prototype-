@@ -1,0 +1,28 @@
+{
+  "description": "HttpServletRequest parameters flow into ProcessBuilder constructor — command injection via user-controlled program and arguments",
+  "tags": [
+    "taint",
+    "cmdi",
+    "servlet"
+  ],
+  "modes": [
+    "full"
+  ],
+  "strict_unexpected": [
+    "taint-unsanitised-flow"
+  ],
+  "expected": [
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": "HIGH",
+      "must_match": true,
+      "line_range": [
+        10,
+        10
+      ],
+      "evidence_contains": [],
+      "notes": "request.getParameter source flows into new ProcessBuilder(program, arg) on line 10. After dedup exactly one finding survives at line 10 (scanner keeps the tightest-source flow — arg at 8:9 has smaller source→sink line distance than program at 7:9).",
+      "max_count": 1
+    }
+  ]
+}

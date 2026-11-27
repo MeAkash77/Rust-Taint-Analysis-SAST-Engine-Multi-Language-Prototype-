@@ -1,0 +1,46 @@
+{
+  "description": "Unsafe YAML deserialization with yaml.load vs safe yaml.safe_load",
+  "tags": [
+    "taint",
+    "deser",
+    "yaml",
+    "flask"
+  ],
+  "modes": [
+    "full",
+    "ast"
+  ],
+  "expected": [
+    {
+      "rule_id": "py.deser.yaml_load",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        7,
+        11
+      ],
+      "evidence_contains": [],
+      "notes": "yaml.load with FullLoader is unsafe with user-controlled data"
+    },
+    {
+      "rule_id": "taint-unsanitised-flow",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        6,
+        12
+      ],
+      "modes": ["full"],
+      "evidence_contains": [],
+      "notes": "User data flows into yaml.load (full mode only; AST mode does not run taint analysis)"
+    },
+    {
+      "rule_id": "cfg-unguarded-sink",
+      "severity": "MEDIUM",
+      "must_match": false,
+      "line_range": [9, 9],
+      "evidence_contains": [],
+      "notes": "yaml.load is a DESERIALIZE sink — structural detection of unguarded deserialization (full mode only)"
+    }
+  ]
+}

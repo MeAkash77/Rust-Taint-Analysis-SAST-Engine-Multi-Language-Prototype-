@@ -1,0 +1,23 @@
+{
+  "description": "scanf with unbounded %s format specifier vs safe %31s with width limit",
+  "tags": [
+    "mem",
+    "scanf"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "c.memory.scanf_percent_s",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        3,
+        7
+      ],
+      "evidence_contains": [],
+      "notes": "scanf(\"%s\", name) \u2014 unbounded read into stack buffer"
+    }
+  ]
+}

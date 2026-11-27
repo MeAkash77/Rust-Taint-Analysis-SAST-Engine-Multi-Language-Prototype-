@@ -1,0 +1,34 @@
+{
+  "description": "Resource leak on panic path in riskyOperation; safeOperation uses defer; recoverWrapper catches panics",
+  "tags": [
+    "cfg",
+    "resource-leak",
+    "panic"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "cfg-resource-leak",
+      "severity": null,
+      "must_match": false,
+      "line_range": [
+        7,
+        18
+      ],
+      "evidence_contains": [],
+      "notes": "If code between os.Open and f.Close panics, f is leaked \u2014 no defer f.Close()"
+    },
+    {
+      "rule_id": "state-use-after-close",
+      "severity": "HIGH",
+      "must_not_match": true,
+      "line_range": [
+        26,
+        26
+      ],
+      "notes": "f.Close() is deferred (line 24), f still open at read on line 26 — state-use-after-close must NOT fire (regression guard for defer-ordering)"
+    }
+  ]
+}

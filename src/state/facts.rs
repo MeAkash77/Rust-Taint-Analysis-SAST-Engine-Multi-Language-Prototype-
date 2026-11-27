@@ -1,0 +1,1223 @@
+#![allow(clippy::unnecessary_map_or)]
+
+use super::domain::{AuthLevel, ProductState, ResourceLifecycle};
+use super::engine::DataflowResult;
+use super::symbol::SymbolInterner;
+use super::transfer::{TransferEvent, TransferEventKind};
+use crate::cfg::{Cfg, StmtKind};
+use crate::labels::{Cap, DataLabel};
+use crate::patterns::Severity;
+use crate::symbol::Lang;
+use petgraph::visit::IntoNodeReferences;
+
+/// Normalize a callee description for display.
+fn sanitize_desc(s: &str) -> String {
+    crate::fmt::normalize_snippet(s)
+}
+
+/// Returns true if `idx` is the terminal exit of a function body, the
+/// convergence node where all execution paths join before leaving the function.
+///
+/// **Invariant:** Only terminal exits carry the complete merged lifecycle state
+/// needed for leak analysis.  Return nodes are intermediate in per-body graphs
+/// (they flow into the synthetic Exit node) but become terminal in legacy
+/// supergraphs (their successor is the file-level Exit with
+/// `enclosing_func = None`).
+///
+/// Detection combines a kind filter with a topological check.  Only nodes
+/// whose `StmtKind` actually terminates execution (`Exit`, `Return`, `Throw`)
+/// are considered, then we require that they have no successor in the same
+/// function scope.  Without the kind filter, dangling Seq nodes left behind
+/// when nested function literals (e.g. `obj.fn = () => {...}`) get a
+/// placeholder in the parent graph would be misclassified as terminal exits
+/// and produce spurious resource-leak findings at the function-literal span.
+fn is_terminal_function_exit(
+    idx: petgraph::graph::NodeIndex,
+    info: &crate::cfg::NodeInfo,
+    cfg: &Cfg,
+) -> bool {
+    if !matches!(
+        info.kind,
+        StmtKind::Exit | StmtKind::Return | StmtKind::Throw
+    ) {
+        return false;
+    }
+    info.ast.enclosing_func.is_some()
+        && !cfg
+            .neighbors_directed(idx, petgraph::Direction::Outgoing)
+            .any(|succ| cfg[succ].ast.enclosing_func == info.ast.enclosing_func)
+}
+
+/// A finding produced by state analysis.
+#[derive(Debug, Clone)]
+pub struct StateFinding {
+    pub rule_id: String,
+    pub severity: Severity,
+    pub span: (usize, usize),
+    pub message: String,
+    /// State machine that produced this finding: `"resource"` or `"auth"`.
+    pub machine: &'static str,
+    /// Variable name involved, if available.
+    pub subject: Option<String>,
+    /// State before the event (e.g. `"closed"`, `"open"`, `"unauthed"`).
+    pub from_state: &'static str,
+    /// State after the event (e.g. `"used"`, `"closed"`, `"leaked"`, `"access"`).
+    pub to_state: &'static str,
+}
+
+/// Extract findings from converged dataflow state + transfer events.
+///
+/// `path_safe_suppressed_sink_spans` lists CFG sink spans whose tainted
+/// inputs were proved path-safe by the SSA taint engine; the privileged
+/// `state-unauthed-access` finding is suppressed on those spans because
+/// the user-controlled input has already been proved unable to escape
+/// into a privileged location.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_findings(
+    result: &DataflowResult<ProductState, TransferEvent>,
+    cfg: &Cfg,
+    interner: &SymbolInterner,
+    lang: Lang,
+    func_summaries: &crate::cfg::FuncSummaries,
+    enable_auth: bool,
+    path_safe_suppressed_sink_spans: &std::collections::HashSet<(usize, usize)>,
+    closure_released_var_names: Option<&std::collections::HashSet<String>>,
+) -> Vec<StateFinding> {
+    let mut findings = Vec::new();
+
+    // ── 1. Use-after-close from transfer events ──────────────────────────
+    for event in &result.events {
+        let info = &cfg[event.node];
+        let var_name = interner.resolve(event.var);
+        match event.kind {
+            TransferEventKind::UseAfterClose => {
+                findings.push(StateFinding {
+                    rule_id: "state-use-after-close".into(),
+                    severity: Severity::High,
+                    span: info.ast.span,
+                    message: format!("variable `{var_name}` used after close"),
+                    machine: "resource",
+                    subject: Some(var_name.to_string()),
+                    from_state: "closed",
+                    to_state: "used",
+                });
+            }
+            TransferEventKind::DoubleClose => {
+                findings.push(StateFinding {
+                    rule_id: "state-double-close".into(),
+                    severity: Severity::Medium,
+                    span: info.ast.span,
+                    message: format!("variable `{var_name}` closed twice"),
+                    machine: "resource",
+                    subject: Some(var_name.to_string()),
+                    from_state: "closed",
+                    to_state: "closed",
+                });
+            }
+        }
+    }
+
+    // ── 2. Resource leaks at Exit and function-Return nodes ──────────────
+
+    // Collect variables with a deferred release call (Go `defer f.Close()`).
+    // These remain OPEN at function exit because transfer skips deferred
+    // releases, but the runtime guarantees cleanup.
+    let deferred_close_vars: std::collections::HashSet<super::symbol::SymbolId> = {
+        let pairs = crate::cfg_analysis::rules::resource_pairs(lang);
+        cfg.node_references()
+            .filter(|(_, ni)| {
+                ni.in_defer
+                    && ni.kind == StmtKind::Call
+                    && ni.call.callee.as_ref().is_some_and(|c| {
+                        let cl = c.to_ascii_lowercase();
+                        pairs.iter().any(|p| {
+                            p.release.iter().any(|r| {
+                                let rl = r.to_ascii_lowercase();
+                                if rl.starts_with('.') {
+                                    cl.ends_with(&rl)
+                                } else {
+                                    cl.ends_with(&rl) || cl == rl
+                                }
+                            })
+                        })
+                    })
+            })
+            .flat_map(|(_, ni)| {
+                let scope = ni.ast.enclosing_func.clone();
+                ni.taint
+                    .uses
+                    .iter()
+                    .filter_map(move |v| interner.get_scoped(scope.as_deref(), v))
+            })
+            .collect()
+    };
+
+    // Collect variables released via inner-call-in-arg shape (Go testify
+    // `require.NoError(t, f.Close())`, `errs = append(errs, f.Close())`,
+    // JUnit `assertEquals(0, in.read())`).  The transfer flips the
+    // lifecycle to CLOSED on the success branch, but the err-return
+    // predecessor that ran after the bare acquire (`f, err := os.Open(...)`)
+    // still merges OPEN at the function-exit join.  Mirror the
+    // `deferred_close_vars` suppression so the OPEN|CLOSED join doesn't
+    // emit a leak-possible for a resource that has a real release site.
+    let inner_arg_close_vars: std::collections::HashSet<super::symbol::SymbolId> = {
+        let pairs = crate::cfg_analysis::rules::resource_pairs(lang);
+        let mut set = std::collections::HashSet::new();
+        for (_, ni) in cfg.node_references() {
+            if ni.in_defer || ni.arg_callees.is_empty() {
+                continue;
+            }
+            let scope = ni.ast.enclosing_func.as_deref();
+            for arg_callee in &ni.arg_callees {
+                let Some(arg_callee_text) = arg_callee.as_deref() else {
+                    continue;
+                };
+                let Some(dot_idx) = arg_callee_text.rfind('.') else {
+                    continue;
+                };
+                let recv_text = &arg_callee_text[..dot_idx];
+                if recv_text.contains('.') {
+                    continue;
+                }
+                let arg_callee_lower = arg_callee_text.to_ascii_lowercase();
+                let matches_release = pairs.iter().any(|p| {
+                    p.release.iter().any(|r| {
+                        let rl = r.to_ascii_lowercase();
+                        if rl.starts_with('.') {
+                            arg_callee_lower.ends_with(&rl)
+                        } else {
+                            arg_callee_lower.ends_with(&rl) || arg_callee_lower == rl
+                        }
+                    })
+                });
+                if !matches_release {
+                    continue;
+                }
+                if let Some(sym) = interner.get_scoped(scope, recv_text) {
+                    set.insert(sym);
+                }
+            }
+        }
+        set
+    };
+
+    for (idx, info) in cfg.node_references() {
+        // File-level Exit (program termination, no enclosing function).
+        let is_file_exit = info.kind == StmtKind::Exit && info.ast.enclosing_func.is_none();
+        // Terminal function exit, the convergence node where all paths join.
+        // Return nodes are intermediate and carry only path-specific state;
+        // only the terminal exit carries the complete merged lifecycle.
+        let is_func_terminal = is_terminal_function_exit(idx, info, cfg);
+        if !is_file_exit && !is_func_terminal {
+            continue;
+        }
+        let Some(state) = result.states.get(&idx) else {
+            continue;
+        };
+
+        for (&sym, &lifecycle) in &state.resource.vars {
+            if !lifecycle.contains(ResourceLifecycle::OPEN) {
+                continue;
+            }
+            let var_name = interner.resolve(sym);
+            let scope = if is_func_terminal {
+                info.ast.enclosing_func.as_deref()
+            } else {
+                None
+            };
+            // The node that acquired the handle, as recorded when it went
+            // OPEN; a name search is the fallback for states without one.
+            let recorded_span = state.acquire_spans.get(&sym).copied();
+            let acquire_node = recorded_span
+                .and_then(|sp| {
+                    cfg.node_references()
+                        .find(|(_, n)| n.kind == StmtKind::Call && n.ast.span == sp)
+                        .map(|(i, _)| i)
+                })
+                .or_else(|| find_acquire_node(cfg, sym, interner, scope));
+
+            // At the file-level Exit, skip variables whose acquire site is
+            // inside a function, those are already handled by the per-
+            // function exit checks above.  Without this, the file-level Exit
+            // would duplicate leak findings with a misleading acquire span
+            // (the first global match instead of the correct function-local one).
+            if is_file_exit {
+                if let Some(acq) = acquire_node {
+                    if cfg[acq].ast.enclosing_func.is_some() {
+                        continue;
+                    }
+                }
+            }
+
+            // Suppress leaks for resources acquired inside managed scopes
+            // (Python `with`, Java try-with-resources). The suppression is
+            // tied to the specific acquire site, not the variable name.
+            if let Some(acq) = acquire_node {
+                if cfg[acq].managed_resource {
+                    continue;
+                }
+            }
+
+            // Suppress leaks for a JDBC `ResultSet` whose lifecycle is owned
+            // by the `Statement` that produced it (see
+            // `is_jdbc_resultset_acquire`).  A standalone `ResultSet` leak is
+            // never a *unique* true positive: closing the owning `Statement`
+            // (via try-with-resources / explicit close) transitively closes
+            // the `ResultSet`, and if the `Statement` itself leaks that leak
+            // already covers the `ResultSet`.  Scoped to Java (the
+            // `executeQuery` acquire pair is Java-only).  Use-after-close /
+            // double-close on the `ResultSet` still fire — those come from
+            // transfer events, not this exit-time leak scan.
+            if lang == Lang::Java
+                && let Some(acq) = acquire_node
+                && is_jdbc_resultset_acquire(cfg[acq].call.callee.as_deref())
+            {
+                continue;
+            }
+
+            // Suppress leaks for a JDBC `Connection` BORROWED from a managed
+            // session / DB abstraction (Liquibase `Database`, Hibernate
+            // `Session`, MyBatis `SqlSession`, JPA `EntityManager`).  The
+            // owner closes the connection as part of its own lifecycle, so
+            // the borrowing body must not — closing it would break the
+            // framework's transaction.  The `borrowed_resource` flag is set
+            // at CFG build by receiver-type discrimination
+            // (`cfg::java_getconnection_receiver_is_borrowed`), so
+            // `DataSource` / static `DriverManager` connections (OWNED) still
+            // fire.  Twin of the suppression in `cfg_analysis::resources`.
+            if lang == Lang::Java
+                && let Some(acq) = acquire_node
+                && cfg[acq].borrowed_resource
+            {
+                continue;
+            }
+
+            // Suppress leaks for a JDBC `Statement` (`PreparedStatement` /
+            // `Statement` / `CallableStatement`) whose owning `Connection` is
+            // itself a resource tracked in THIS body.  Per JDBC, closing a
+            // `Connection` closes every `Statement` it produced, so a
+            // statement derived from a locally-acquired connection — whether
+            // the connection is closed in-body, borrowed/managed, or itself a
+            // leaking local (its own leak is the actionable root) — is never a
+            // unique true positive.  The derivation edge `ps -> con` is read
+            // off the acquire callee (`con.prepareStatement`); the owner is
+            // confirmed to be a locally-acquired `Connection` via its own
+            // acquire node.  A statement on a long-lived / field / parameter
+            // connection this body does not track is KEPT (it genuinely
+            // accumulates).  Twin of the suppression in
+            // `cfg_analysis::resources`.  Interior-node sibling of the
+            // `ResultSet` leaf suppression above.  The same holds for a
+            // Python DB-API cursor opened on a connection this body acquired
+            // (`with sqlite3.connect(p) as conn: cur = conn.cursor()`).
+            if let Some(acq) = acquire_node
+                && let Some(owner) = crate::cfg_analysis::rules::derived_resource_owner(
+                    lang,
+                    cfg[acq].call.callee.as_deref(),
+                )
+            {
+                let owner_scope = cfg[acq].ast.enclosing_func.as_deref();
+                if let Some(owner_sym) = interner.get_scoped(owner_scope, owner)
+                    && let Some(owner_acq) =
+                        find_acquire_node(cfg, owner_sym, interner, owner_scope)
+                    && crate::cfg_analysis::rules::is_owning_connection_acquire(
+                        lang,
+                        cfg[owner_acq].call.callee.as_deref(),
+                    )
+                {
+                    continue;
+                }
+            }
+
+            // Suppress leaks for variables with a deferred close call
+            // (Go `defer f.Close()`). The deferred call guarantees cleanup
+            // at function exit even though transfer didn't mark it CLOSED.
+            if deferred_close_vars.contains(&sym) {
+                continue;
+            }
+
+            // Suppress leaks for variables released via inner-call-in-arg
+            // shape.  Mirrors the deferred-close suppression so the
+            // OPEN-on-err-return / CLOSED-on-success-branch merge at
+            // function exit does not surface as leak-possible.
+            if inner_arg_close_vars.contains(&sym) {
+                continue;
+            }
+
+            // Suppress leaks for variables whose release call lives in a
+            // nested closure (callback / event handler) outside this
+            // body's CFG.  Common JS/TS shape:
+            //   const ws = new WebSocket(url);
+            //   socket.on("close", () => ws.close());
+            // The per-body resource analysis cannot observe the close
+            // inside the registered handler body; without this gate the
+            // handle reads as a definite leak.  Match by variable name —
+            // closure-captured handles share the binding name with the
+            // handle in the outer scope.
+            if closure_released_var_names
+                .map(|s| s.contains(var_name))
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
+            // Prefer direct acquire node span; fall back to proxy span
+            // from ResourceMethodSummary (cross-body resource tracking).
+            let acquire_span = acquire_node
+                .map(|n| cfg[n].ast.span)
+                .or_else(|| state.proxy_acquire_spans.get(&sym).copied());
+
+            // Suppress/downgrade leaks for variables returned from the
+            // function (factory pattern).  Only suppress when ALL
+            // predecessors that have the variable OPEN also return it.
+            // Mixed cases (some paths return, some leak) are downgraded
+            // to state-resource-leak-possible.
+            if is_func_terminal {
+                let scope = info.ast.enclosing_func.as_deref();
+                let mut returned_open = 0u32;
+                let mut non_returned_open = 0u32;
+                for pred in cfg.neighbors_directed(idx, petgraph::Direction::Incoming) {
+                    let Some(ps) = result.states.get(&pred) else {
+                        continue;
+                    };
+                    let pred_has_open = ps
+                        .resource
+                        .vars
+                        .get(&sym)
+                        .map_or(false, |lc| lc.contains(ResourceLifecycle::OPEN));
+                    if !pred_has_open {
+                        continue;
+                    }
+                    // Only Return nodes can transfer resource ownership to the
+                    // caller.  Non-Return predecessors (exception edges, implicit
+                    // fallthrough) with OPEN resources represent genuine leaks.
+                    // The handle must be in an escape position of the returned
+                    // expression (`return f`, `return f, nil`,
+                    // `return &W{f: f}`); `return f.read()` merely mentions it.
+                    // C / C++ keep the mention rule, see `return_hands_off`.
+                    let returns_var = super::transfer::return_hands_off(lang, &cfg[pred], |u| {
+                        let id = interner.get_scoped(scope, u);
+                        id == Some(sym) || id.and_then(|i| ps.sub_aliases.get(&i)) == Some(&sym)
+                    });
+                    if returns_var {
+                        returned_open += 1;
+                    } else {
+                        non_returned_open += 1;
+                    }
+                }
+                if returned_open > 0 && non_returned_open == 0 {
+                    continue; // all OPEN paths transfer ownership to caller
+                }
+                if returned_open > 0 && non_returned_open > 0 {
+                    // Mixed: some paths return resource, some leak it.
+                    findings.push(StateFinding {
+                        rule_id: "state-resource-leak-possible".into(),
+                        severity: Severity::Low,
+                        span: acquire_span.unwrap_or(info.ast.span),
+                        message: format!("resource `{var_name}` may not be closed on all paths"),
+                        machine: "resource",
+                        subject: Some(var_name.to_string()),
+                        from_state: "open",
+                        to_state: "possibly_leaked",
+                    });
+                    continue;
+                }
+                // returned_open == 0: fall through to normal leak detection
+            }
+
+            if !lifecycle.contains(ResourceLifecycle::CLOSED)
+                && !lifecycle.contains(ResourceLifecycle::MOVED)
+            {
+                // Definite leak: open on all paths, never closed
+                findings.push(StateFinding {
+                    rule_id: "state-resource-leak".into(),
+                    severity: Severity::Medium,
+                    span: acquire_span.unwrap_or(info.ast.span),
+                    message: format!("resource `{var_name}` is never closed"),
+                    machine: "resource",
+                    subject: Some(var_name.to_string()),
+                    from_state: "open",
+                    to_state: "leaked",
+                });
+            } else if lifecycle.contains(ResourceLifecycle::CLOSED) {
+                // May-leak: open on some paths, closed on others
+                findings.push(StateFinding {
+                    rule_id: "state-resource-leak-possible".into(),
+                    severity: Severity::Low,
+                    span: acquire_span.unwrap_or(info.ast.span),
+                    message: format!("resource `{var_name}` may not be closed on all paths"),
+                    machine: "resource",
+                    subject: Some(var_name.to_string()),
+                    from_state: "open",
+                    to_state: "possibly_leaked",
+                });
+            }
+        }
+    }
+
+    // ── 2b. Proxy-acquired possible leaks (exception-path heuristic) ────
+    // In JS/TS, any call can throw. If a proxy-acquired resource is fully
+    // CLOSED at function exit (no OPEN paths), check whether there are
+    // intervening calls between the proxy acquire and release nodes that
+    // could throw and bypass the release. If so, emit a possible leak.
+    //
+    // **Language gate**: this heuristic is JS/TS-specific.  Other
+    // languages (Go, Java, C, C++, Python, Rust, Ruby, PHP) use
+    // explicit error returns / try-catch with deterministic control
+    // flow, an intervening call does NOT silently bypass a release.
+    // Firing this on Go gave the gin/context.go FP where any method
+    // calling another method (`c.Set`, `c.Get`) was flagged as a
+    // possible leak on the receiver.  Skip the section but continue
+    // to section 3 (auth-required sinks) which is independent of the
+    // resource state machine.
+    if matches!(lang, Lang::JavaScript | Lang::TypeScript) {
+        for (idx, info) in cfg.node_references() {
+            if !is_terminal_function_exit(idx, info, cfg) {
+                continue;
+            }
+            let Some(state) = result.states.get(&idx) else {
+                continue;
+            };
+            for (&sym, &lifecycle) in &state.resource.vars {
+                // Only for proxy-acquired resources that are fully CLOSED at exit
+                if !state.proxy_acquire_spans.contains_key(&sym) {
+                    continue;
+                }
+                if lifecycle.contains(ResourceLifecycle::OPEN) {
+                    continue; // Already handled by the normal leak detection above
+                }
+                if !lifecycle.contains(ResourceLifecycle::CLOSED) {
+                    continue;
+                }
+                // Check if there are intervening Call nodes between acquire and
+                // release in the CFG (these could throw and bypass the release).
+                //
+                // NOTE: a stricter variant (audit #59) tried to exclude the
+                // resource's own lifecycle ops (the acquire/release proxy
+                // calls) and require reachability from the acquire node, to
+                // suppress spurious findings on correctly open/close-paired
+                // proxies.  That over-suppressed a *tested* true positive: a
+                // class-field resource (`this.fd = fs.openSync(...)` in `open()`
+                // with `close()` in a separate method — see
+                // `tests/fixtures/real_world/typescript/cfg/try_catch_typed.ts`)
+                // has only its own acquire call in scope, so excluding it left
+                // zero intervening calls and dropped the must-match leak
+                // finding.  Distinguishing a clean same-scope open/close pair
+                // from a cross-method field leak needs proper inter-method
+                // lifecycle modelling (deep-fix queue), so we keep the original
+                // span-based exclusion here.
+                let has_intervening_calls = cfg.node_references().any(|(_, ni)| {
+                    ni.kind == StmtKind::Call
+                        && ni.ast.enclosing_func == info.ast.enclosing_func
+                        && ni.call.callee.is_some()
+                        // Not the acquire or release proxy itself
+                        && !state.proxy_acquire_spans.values().any(|s| *s == ni.ast.span)
+                });
+                if has_intervening_calls {
+                    let var_name = interner.resolve(sym);
+                    let acquire_span = state.proxy_acquire_spans.get(&sym).copied();
+                    findings.push(StateFinding {
+                        rule_id: "state-resource-leak-possible".into(),
+                        severity: Severity::Low,
+                        span: acquire_span.unwrap_or(info.ast.span),
+                        message: format!("resource `{var_name}` may not be closed on all paths"),
+                        machine: "resource",
+                        subject: Some(var_name.to_string()),
+                        from_state: "open",
+                        to_state: "possibly_leaked",
+                    });
+                }
+            }
+        }
+    }
+
+    // ── 3. Auth-required sinks ───────────────────────────────────────────
+    // Only run auth analysis when explicitly enabled (higher FP rate).
+    // Check if any function is a web entrypoint
+    let has_web_entrypoint = enable_auth
+        && cfg.node_references().any(|(_, info)| {
+            if let Some(ref func_name) = info.ast.enclosing_func {
+                is_web_entrypoint_simple(func_name, lang, func_summaries, cfg)
+            } else {
+                false
+            }
+        });
+
+    if has_web_entrypoint {
+        for (idx, info) in cfg.node_references() {
+            if !is_privileged_sink(info) {
+                continue;
+            }
+            let Some(state) = result.states.get(&idx) else {
+                continue;
+            };
+            if state.auth.auth_level == AuthLevel::Unauthed {
+                // Suppress when the SSA taint engine has already proved
+                // the tainted input flowing into this sink is path-safe
+                // (PathFact `dotdot=No && absolute=No`).  A web handler
+                // reading a sanitised user-controlled path is not the
+                // same shape as a handler reading any user-controlled
+                // path, the auth concern reduces once the data cannot
+                // escape into a privileged location.  Note this is per
+                // CFG-node span, so co-located unrelated sinks are
+                // unaffected.
+                if path_safe_suppressed_sink_spans.contains(&info.ast.span) {
+                    continue;
+                }
+                let callee_desc =
+                    sanitize_desc(info.call.callee.as_deref().unwrap_or("(sensitive op)"));
+                findings.push(StateFinding {
+                    rule_id: "state-unauthed-access".into(),
+                    severity: Severity::High,
+                    span: info.ast.span,
+                    message: format!(
+                        "sensitive operation `{callee_desc}` reached without authentication"
+                    ),
+                    machine: "auth",
+                    subject: None,
+                    from_state: "unauthed",
+                    to_state: "access",
+                });
+            }
+        }
+    }
+
+    // Dedup
+    findings.sort_by(|a, b| a.span.cmp(&b.span).then_with(|| a.rule_id.cmp(&b.rule_id)));
+    findings.dedup_by(|a, b| a.span == b.span && a.rule_id == b.rule_id);
+
+    findings
+}
+
+/// Find the CFG node where a variable was acquired (defined via Call node).
+/// Whether an acquire-site callee produces a JDBC `ResultSet`
+/// (`stmt.executeQuery()` / `stmt.getResultSet()`).
+///
+/// A `ResultSet` is a leaf resource owned by the `Statement` that produced
+/// it.  Per the JDBC contract, closing a `Statement` closes its current
+/// `ResultSet`, and closing a `Connection` closes its `Statement`s — so the
+/// `ResultSet`'s close is always the statement's responsibility.  This makes
+/// a standalone `ResultSet` leak reported at function exit either a false
+/// positive (statement closed → result set transitively closed) or redundant
+/// (statement also leaks → that leak already covers the result set), never a
+/// unique true positive.  Real-repo drivers: openmrs
+/// `DatabaseUpdater.java:288` (`ResultSet resultSet = ps.executeQuery();`
+/// inside a try-with-resources on `ps`), sonarqube
+/// `ExportLineHashesStep.java:75`.
+///
+/// The `.getResultSet` form is future-proofing: it is not currently a
+/// tracked acquire pair, so the check is dormant for it today.
+fn is_jdbc_resultset_acquire(callee: Option<&str>) -> bool {
+    let Some(callee) = callee else { return false };
+    let callee = callee.to_ascii_lowercase();
+    callee == "executequery"
+        || callee.ends_with(".executequery")
+        || callee == "getresultset"
+        || callee.ends_with(".getresultset")
+}
+
+fn find_acquire_node(
+    cfg: &Cfg,
+    sym: super::symbol::SymbolId,
+    interner: &SymbolInterner,
+    enclosing_func: Option<&str>,
+) -> Option<petgraph::graph::NodeIndex> {
+    let var_name = interner.resolve(sym);
+    // Try function-scoped match first (correct for multi-function files
+    // where the same variable name appears in multiple functions).
+    if let Some(func) = enclosing_func {
+        for (idx, info) in cfg.node_references() {
+            if info.kind == StmtKind::Call
+                && info.ast.enclosing_func.as_deref() == Some(func)
+                && info.taint.defines.as_deref() == Some(var_name)
+            {
+                return Some(idx);
+            }
+        }
+    }
+    // Fallback: first global match (for file-level Exit or top-level code).
+    for (idx, info) in cfg.node_references() {
+        if info.kind == StmtKind::Call && info.taint.defines.as_deref() == Some(var_name) {
+            return Some(idx);
+        }
+    }
+    None
+}
+
+/// Check if a node is a privileged sink (shell execution or file I/O).
+fn is_privileged_sink(info: &crate::cfg::NodeInfo) -> bool {
+    info.taint.labels.iter().any(|l| {
+        if let DataLabel::Sink(caps) = l {
+            caps.intersects(Cap::SHELL_ESCAPE | Cap::FILE_IO)
+        } else {
+            false
+        }
+    })
+}
+
+/// Simplified web entrypoint check (avoids AnalysisContext dependency).
+fn is_web_entrypoint_simple(
+    func_name: &str,
+    lang: Lang,
+    func_summaries: &crate::cfg::FuncSummaries,
+    _cfg: &Cfg,
+) -> bool {
+    let name_lower = func_name.to_ascii_lowercase();
+
+    // Skip bare "main", it's typically a CLI entry
+    if name_lower == "main" {
+        return false;
+    }
+
+    let is_handler_name = name_lower.starts_with("handle_")
+        || name_lower.starts_with("route_")
+        || name_lower.starts_with("api_")
+        || name_lower.starts_with("serve_")
+        || name_lower.starts_with("process_")
+        || name_lower == "handler";
+
+    if !is_handler_name {
+        return false;
+    }
+
+    // Check for web-like parameters
+    let web_params: &[&str] = match lang {
+        Lang::Rust => &["request", "req", "json", "query", "form", "payload", "body"],
+        Lang::JavaScript | Lang::TypeScript => &["req", "request", "ctx", "res", "response"],
+        Lang::Python => &["request", "req"],
+        Lang::Go => &["w", "writer", "r", "req", "request"],
+        Lang::Java => &["request", "req"],
+        _ => &["request", "req"],
+    };
+
+    // Confirm web parameters against THIS candidate handler only, not any
+    // function in the file.  Scanning every summary made an unrelated
+    // function's `req`/`r`/`ctx` parameter promote every
+    // `process_*`/`api_*`/`serve_*` function in the file to a web
+    // entrypoint, firing High-severity state-unauthed-access on batch/CLI
+    // code.  Filter the file-level summary map down to the named function
+    // via `FuncKey.name` (matches `info.ast.enclosing_func`); summary
+    // `entry` NodeIndexes are not valid in the per-body CFG, so the name
+    // is the safe selector here.
+    let has_web_params = func_summaries
+        .iter()
+        .filter(|(key, _)| key.name == func_name)
+        .any(|(_, s)| {
+            s.param_names
+                .iter()
+                .any(|p| web_params.contains(&p.to_ascii_lowercase().as_str()))
+        });
+
+    // Only handle_* and route_* are strong enough to skip param confirmation.
+    // api_*, serve_*, process_* require web parameter evidence.
+    let strong_name = name_lower.starts_with("handle_") || name_lower.starts_with("route_");
+
+    has_web_params || strong_name
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cfg::{AstMeta, CallMeta, EdgeKind, NodeInfo, TaintMeta};
+    use crate::cfg_analysis::rules;
+    use crate::state::domain::ProductState;
+    use crate::state::engine;
+    use crate::state::symbol::SymbolInterner;
+    use crate::state::transfer::DefaultTransfer;
+    use petgraph::Graph;
+    use std::collections::HashMap;
+
+    fn make_node(kind: StmtKind) -> NodeInfo {
+        NodeInfo {
+            kind,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn jdbc_resultset_acquire_recognises_execute_query_and_get_result_set() {
+        // Receiver-qualified and (defensively) bare forms, case-insensitive.
+        assert!(is_jdbc_resultset_acquire(Some("ps.executeQuery")));
+        assert!(is_jdbc_resultset_acquire(Some("stmt.executeQuery")));
+        assert!(is_jdbc_resultset_acquire(Some("EXECUTEQUERY")));
+        assert!(is_jdbc_resultset_acquire(Some("rs.getResultSet")));
+        assert!(is_jdbc_resultset_acquire(Some(
+            "conn.prepareStatement().executeQuery"
+        )));
+        // Not a ResultSet producer: the owning statement / update path / a
+        // method that merely ends in a different verb.
+        assert!(!is_jdbc_resultset_acquire(Some("con.prepareStatement")));
+        assert!(!is_jdbc_resultset_acquire(Some("stmt.executeUpdate")));
+        assert!(!is_jdbc_resultset_acquire(Some("con.getConnection")));
+        assert!(!is_jdbc_resultset_acquire(Some("myExecuteQueryHelper")));
+        assert!(!is_jdbc_resultset_acquire(None));
+    }
+
+    #[test]
+    fn detects_resource_leak() {
+        // Entry → fopen(f) → Exit (no close)
+        let mut cfg: Cfg = Graph::new();
+        let entry = cfg.add_node(make_node(StmtKind::Entry));
+        let open_node = cfg.add_node(NodeInfo {
+            kind: StmtKind::Call,
+            ast: AstMeta {
+                span: (10, 20),
+                ..Default::default()
+            },
+            taint: TaintMeta {
+                defines: Some("f".into()),
+                ..Default::default()
+            },
+            call: CallMeta {
+                callee: Some("fopen".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let exit = cfg.add_node(make_node(StmtKind::Exit));
+
+        cfg.add_edge(entry, open_node, EdgeKind::Seq);
+        cfg.add_edge(open_node, exit, EdgeKind::Seq);
+
+        let interner = SymbolInterner::from_cfg(&cfg);
+        let transfer = DefaultTransfer {
+            lang: Lang::C,
+            resource_pairs: rules::resource_pairs(Lang::C),
+            interner: &interner,
+            resource_method_summaries: &[],
+            ptr_proxy_hints: None,
+            nonescaping_field_containers: None,
+            closeable_wrappers: None,
+        };
+
+        let result = engine::run_forward(&cfg, entry, &transfer, ProductState::initial());
+        let findings = extract_findings(
+            &result,
+            &cfg,
+            &interner,
+            Lang::C,
+            &HashMap::new(),
+            false,
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].rule_id, "state-resource-leak");
+        assert!(findings[0].message.contains("f"));
+    }
+
+    #[test]
+    fn clean_open_close_no_findings() {
+        // Entry → fopen(f) → fclose(f) → Exit
+        let mut cfg: Cfg = Graph::new();
+        let entry = cfg.add_node(make_node(StmtKind::Entry));
+        let open_node = cfg.add_node(NodeInfo {
+            kind: StmtKind::Call,
+            taint: TaintMeta {
+                defines: Some("f".into()),
+                ..Default::default()
+            },
+            call: CallMeta {
+                callee: Some("fopen".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let close_node = cfg.add_node(NodeInfo {
+            kind: StmtKind::Call,
+            taint: TaintMeta {
+                uses: vec!["f".into()],
+                ..Default::default()
+            },
+            call: CallMeta {
+                callee: Some("fclose".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let exit = cfg.add_node(make_node(StmtKind::Exit));
+
+        cfg.add_edge(entry, open_node, EdgeKind::Seq);
+        cfg.add_edge(open_node, close_node, EdgeKind::Seq);
+        cfg.add_edge(close_node, exit, EdgeKind::Seq);
+
+        let interner = SymbolInterner::from_cfg(&cfg);
+        let transfer = DefaultTransfer {
+            lang: Lang::C,
+            resource_pairs: rules::resource_pairs(Lang::C),
+            interner: &interner,
+            resource_method_summaries: &[],
+            ptr_proxy_hints: None,
+            nonescaping_field_containers: None,
+            closeable_wrappers: None,
+        };
+
+        let result = engine::run_forward(&cfg, entry, &transfer, ProductState::initial());
+        let findings = extract_findings(
+            &result,
+            &cfg,
+            &interner,
+            Lang::C,
+            &HashMap::new(),
+            false,
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    fn make_func_node(kind: StmtKind, func: &str) -> NodeInfo {
+        NodeInfo {
+            kind,
+            ast: AstMeta {
+                enclosing_func: Some(func.to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn terminal_exit_is_topological() {
+        // Per-body graph: Entry → Call → Return → Exit (all enclosing_func=Some)
+        // Only Exit should be terminal (no successors in same scope).
+        let mut cfg: Cfg = Graph::new();
+        let entry = cfg.add_node(make_func_node(StmtKind::Entry, "f"));
+        let call = cfg.add_node(NodeInfo {
+            kind: StmtKind::Call,
+            call: CallMeta {
+                callee: Some("fopen".into()),
+                ..Default::default()
+            },
+            taint: TaintMeta {
+                defines: Some("x".into()),
+                ..Default::default()
+            },
+            ast: AstMeta {
+                enclosing_func: Some("f".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let ret = cfg.add_node(NodeInfo {
+            kind: StmtKind::Return,
+            taint: TaintMeta {
+                uses: vec!["x".into()],
+                ..Default::default()
+            },
+            ast: AstMeta {
+                enclosing_func: Some("f".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let exit = cfg.add_node(make_func_node(StmtKind::Exit, "f"));
+
+        cfg.add_edge(entry, call, EdgeKind::Seq);
+        cfg.add_edge(call, ret, EdgeKind::Seq);
+        cfg.add_edge(ret, exit, EdgeKind::Seq);
+
+        assert!(
+            !is_terminal_function_exit(entry, &cfg[entry], &cfg),
+            "Entry must not be terminal"
+        );
+        assert!(
+            !is_terminal_function_exit(call, &cfg[call], &cfg),
+            "Call must not be terminal"
+        );
+        assert!(
+            !is_terminal_function_exit(ret, &cfg[ret], &cfg),
+            "Return must not be terminal — it flows into Exit"
+        );
+        assert!(
+            is_terminal_function_exit(exit, &cfg[exit], &cfg),
+            "Exit must be terminal — no successors in same scope"
+        );
+    }
+
+    #[test]
+    fn per_body_factory_returned_resource_no_finding() {
+        // Per-body graph: Entry → fopen(f) → return f → Exit
+        // All nodes have enclosing_func=Some("factory").
+        // The resource is returned, no leak finding expected.
+        let func = "factory";
+        let mut cfg: Cfg = Graph::new();
+        let entry = cfg.add_node(make_func_node(StmtKind::Entry, func));
+        let open_node = cfg.add_node(NodeInfo {
+            kind: StmtKind::Call,
+            ast: AstMeta {
+                span: (10, 20),
+                enclosing_func: Some(func.into()),
+            },
+            taint: TaintMeta {
+                defines: Some("f".into()),
+                ..Default::default()
+            },
+            call: CallMeta {
+                callee: Some("fopen".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let ret = cfg.add_node(NodeInfo {
+            kind: StmtKind::Return,
+            taint: TaintMeta {
+                uses: vec!["f".into()],
+                ..Default::default()
+            },
+            // `return f;`: the handle itself is the returned value.
+            returned_idents: vec!["f".into()],
+            ast: AstMeta {
+                enclosing_func: Some(func.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let exit = cfg.add_node(make_func_node(StmtKind::Exit, func));
+
+        cfg.add_edge(entry, open_node, EdgeKind::Seq);
+        cfg.add_edge(open_node, ret, EdgeKind::Seq);
+        cfg.add_edge(ret, exit, EdgeKind::Seq);
+
+        let findings = run_factory_cfg(&cfg, entry);
+        assert!(
+            findings.is_empty(),
+            "Resource returned from factory must not produce leak finding.\n  Got: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+    }
+
+    fn run_factory_cfg(cfg: &Cfg, entry: petgraph::graph::NodeIndex) -> Vec<StateFinding> {
+        run_factory_cfg_in(Lang::C, cfg, entry)
+    }
+
+    fn run_factory_cfg_in(
+        lang: Lang,
+        cfg: &Cfg,
+        entry: petgraph::graph::NodeIndex,
+    ) -> Vec<StateFinding> {
+        let interner = SymbolInterner::from_cfg_scoped(cfg);
+        let transfer = DefaultTransfer {
+            lang,
+            resource_pairs: rules::resource_pairs(lang),
+            interner: &interner,
+            resource_method_summaries: &[],
+            ptr_proxy_hints: None,
+            nonescaping_field_containers: None,
+            closeable_wrappers: None,
+        };
+        let result = engine::run_forward(cfg, entry, &transfer, ProductState::initial());
+        extract_findings(
+            &result,
+            cfg,
+            &interner,
+            lang,
+            &HashMap::new(),
+            false,
+            &std::collections::HashSet::new(),
+            None,
+        )
+    }
+
+    /// `<handle> = <acquire>(..); return <reader>(<handle>);` in `lang`.
+    fn return_mentions_handle_cfg(
+        acquire: &str,
+        reader: &str,
+    ) -> (Cfg, petgraph::graph::NodeIndex) {
+        let func = "reader";
+        let mut cfg: Cfg = Graph::new();
+        let entry = cfg.add_node(make_func_node(StmtKind::Entry, func));
+        let open_node = cfg.add_node(NodeInfo {
+            kind: StmtKind::Call,
+            ast: AstMeta {
+                span: (10, 20),
+                enclosing_func: Some(func.into()),
+            },
+            taint: TaintMeta {
+                defines: Some("f".into()),
+                ..Default::default()
+            },
+            call: CallMeta {
+                callee: Some(acquire.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let ret = cfg.add_node(NodeInfo {
+            kind: StmtKind::Return,
+            taint: TaintMeta {
+                uses: vec![reader.into(), "f".into()],
+                ..Default::default()
+            },
+            returned_call_callees: vec![reader.into()],
+            ast: AstMeta {
+                enclosing_func: Some(func.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let exit = cfg.add_node(make_func_node(StmtKind::Exit, func));
+        cfg.add_edge(entry, open_node, EdgeKind::Seq);
+        cfg.add_edge(open_node, ret, EdgeKind::Seq);
+        cfg.add_edge(ret, exit, EdgeKind::Seq);
+        (cfg, entry)
+    }
+
+    #[test]
+    fn per_body_return_mentioning_handle_without_escape_leaks() {
+        // Python `f = open(p); return json.load(f)`: the caller gets the
+        // parsed value, not the file.
+        let (cfg, entry) = return_mentions_handle_cfg("open", "json.load");
+        let findings = run_factory_cfg_in(Lang::Python, &cfg, entry);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|f| f.rule_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["state-resource-leak"],
+        );
+    }
+
+    #[test]
+    fn per_body_c_return_mentioning_pointer_hands_it_off() {
+        // C `b = malloc(n); return insert(t, b);`: ownership commonly moves
+        // into the callee, and there is no model of what it keeps.
+        let (cfg, entry) = return_mentions_handle_cfg("malloc", "insert");
+        assert!(run_factory_cfg_in(Lang::C, &cfg, entry).is_empty());
+    }
+
+    #[test]
+    fn per_body_non_returned_resource_leaks() {
+        // Per-body graph: Entry → fopen(f) → return (no uses) → Exit
+        // All nodes have enclosing_func=Some("leaker").
+        // Resource is NOT returned, exactly one state-resource-leak expected.
+        let func = "leaker";
+        let mut cfg: Cfg = Graph::new();
+        let entry = cfg.add_node(make_func_node(StmtKind::Entry, func));
+        let open_node = cfg.add_node(NodeInfo {
+            kind: StmtKind::Call,
+            ast: AstMeta {
+                span: (10, 20),
+                enclosing_func: Some(func.into()),
+            },
+            taint: TaintMeta {
+                defines: Some("f".into()),
+                ..Default::default()
+            },
+            call: CallMeta {
+                callee: Some("fopen".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let ret = cfg.add_node(NodeInfo {
+            kind: StmtKind::Return,
+            ast: AstMeta {
+                enclosing_func: Some(func.into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let exit = cfg.add_node(make_func_node(StmtKind::Exit, func));
+
+        cfg.add_edge(entry, open_node, EdgeKind::Seq);
+        cfg.add_edge(open_node, ret, EdgeKind::Seq);
+        cfg.add_edge(ret, exit, EdgeKind::Seq);
+
+        let interner = SymbolInterner::from_cfg_scoped(&cfg);
+        let transfer = DefaultTransfer {
+            lang: Lang::C,
+            resource_pairs: rules::resource_pairs(Lang::C),
+            interner: &interner,
+            resource_method_summaries: &[],
+            ptr_proxy_hints: None,
+            nonescaping_field_containers: None,
+            closeable_wrappers: None,
+        };
+
+        let result = engine::run_forward(&cfg, entry, &transfer, ProductState::initial());
+        let findings = extract_findings(
+            &result,
+            &cfg,
+            &interner,
+            Lang::C,
+            &HashMap::new(),
+            false,
+            &std::collections::HashSet::new(),
+            None,
+        );
+
+        assert_eq!(
+            findings.len(),
+            1,
+            "Non-returned resource must produce exactly one finding.\n  Got: {:?}",
+            findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
+        );
+        assert_eq!(findings[0].rule_id, "state-resource-leak");
+    }
+
+    /// Finding #64: `is_web_entrypoint_simple` must confirm web parameters
+    /// against the *candidate* handler only, not any function in the file.
+    /// Before the fix, an unrelated `read_stream(req)` in the same file
+    /// promoted every `process_*` function to a web entrypoint, firing
+    /// High-severity `state-unauthed-access` on batch/CLI code.
+    #[test]
+    fn web_entrypoint_param_confirmation_is_per_function() {
+        use crate::cfg::LocalFuncSummary;
+        use crate::symbol::FuncKey;
+        use petgraph::graph::NodeIndex;
+
+        fn summary(name: &str, params: &[&str]) -> (FuncKey, LocalFuncSummary) {
+            let key = FuncKey::new_function(Lang::Python, "f.py", name, Some(params.len()));
+            let s = LocalFuncSummary {
+                entry: NodeIndex::new(0),
+                source_caps: Cap::empty(),
+                sanitizer_caps: Cap::empty(),
+                sink_caps: Cap::empty(),
+                param_count: params.len(),
+                param_names: params.iter().map(|p| p.to_string()).collect(),
+                propagating_params: Vec::new(),
+                tainted_sink_params: Vec::new(),
+                callees: Vec::new(),
+                container: String::new(),
+                disambig: None,
+                kind: crate::symbol::FuncKind::Function,
+            };
+            (key, s)
+        }
+
+        // `process_data` has NO web-like parameters; `read_stream` does.
+        let mut summaries: crate::cfg::FuncSummaries = HashMap::new();
+        let (k1, s1) = summary("process_data", &["data"]);
+        let (k2, s2) = summary("read_stream", &["req"]);
+        summaries.insert(k1, s1);
+        summaries.insert(k2, s2);
+
+        let cfg: Cfg = Graph::new();
+
+        // The unrelated `read_stream(req)` must NOT promote `process_data`.
+        assert!(
+            !is_web_entrypoint_simple("process_data", Lang::Python, &summaries, &cfg),
+            "process_data has no web params and must not be a web entrypoint just \
+             because an unrelated function in the file does"
+        );
+
+        // `read_stream` is not a handler-prefixed name, so even though it
+        // carries the `req` param it is NOT an entrypoint — confirms the
+        // name gate still stands independently of the param check.
+        assert!(
+            !is_web_entrypoint_simple("read_stream", Lang::Python, &summaries, &cfg),
+            "read_stream lacks a handler-prefixed name and must not be an entrypoint"
+        );
+
+        // Positive control: give `process_data` its own `req` param.
+        let mut summaries2: crate::cfg::FuncSummaries = HashMap::new();
+        let (k3, s3) = summary("process_data", &["req"]);
+        summaries2.insert(k3, s3);
+        assert!(
+            is_web_entrypoint_simple("process_data", Lang::Python, &summaries2, &cfg),
+            "process_data with its own web param must be a web entrypoint"
+        );
+    }
+}

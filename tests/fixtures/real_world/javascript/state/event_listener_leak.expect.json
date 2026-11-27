@@ -1,0 +1,13 @@
+{
+  "description": "Event listener leak: socket connections accumulate without cleanup handlers. Safe version registers close and error handlers.",
+  "tags": [
+    "state",
+    "resource-leak",
+    "event-listener",
+    "net"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": []
+}

@@ -1,0 +1,24 @@
+{
+  "description": "sprintf/strcpy/strcat called with only hardcoded string literals — no taint source. Layer D suppression (src/ast.rs::is_c_buffer_call_literal_safe) correctly recognises strcpy/strcat with string-literal source as bounded-length: only the sprintf with bare `%s` in its format keeps firing.",
+  "tags": [
+    "taint",
+    "negative",
+    "buffer"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "c.memory.sprintf",
+      "severity": "HIGH",
+      "must_match": true,
+      "line_range": [
+        5,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "sprintf format `\"Hello, %s!\"` has bare `%s` so Layer D refuses to suppress — the pattern rule fires correctly."
+    }
+  ]
+}

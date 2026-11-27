@@ -1,0 +1,78 @@
+{
+  "description": "malloc lifecycle: leak (no free), double free, and use after free patterns",
+  "tags": [
+    "state",
+    "resource-lifecycle"
+  ],
+  "modes": [
+    "full"
+  ],
+  "expected": [
+    {
+      "rule_id": "state-resource-leak",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        3,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "malloc at line 5 never freed in alloc_leak"
+    },
+    {
+      "rule_id": "state-double-close",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        15,
+        20
+      ],
+      "evidence_contains": [],
+      "notes": "free called twice on same pointer in double_free"
+    },
+    {
+      "rule_id": "state-use-after-close",
+      "severity": null,
+      "must_match": true,
+      "line_range": [
+        21,
+        26
+      ],
+      "evidence_contains": [],
+      "notes": "strcpy on buf after free in use_after_free"
+    },
+    {
+      "rule_id": "c.memory.strcpy",
+      "severity": "HIGH",
+      "must_match": false,
+      "line_range": [
+        5,
+        8
+      ],
+      "evidence_contains": [],
+      "notes": "Deliberately suppressed by Layer D (`is_c_buffer_call_literal_safe` in src/ast.rs): the source argument is a string literal (`\"hello\"`) so the contributed length is statically bounded \u2014 no attacker-controlled overflow vector regardless of `buf`'s size. Positive coverage for the unsuppressed path lives in tests/fixtures/real_world/c/taint/buffer_overflow.c (`strcpy(buf, input)` where input is a parameter)."
+    },
+    {
+      "rule_id": "c.memory.strcpy",
+      "severity": "HIGH",
+      "must_match": false,
+      "line_range": [
+        10,
+        13
+      ],
+      "evidence_contains": [],
+      "notes": "Suppressed by Layer D: literal source. See line 5 entry for full rationale."
+    },
+    {
+      "rule_id": "c.memory.strcpy",
+      "severity": "HIGH",
+      "must_match": false,
+      "line_range": [
+        23,
+        26
+      ],
+      "evidence_contains": [],
+      "notes": "Suppressed by Layer D: literal source `\"oops\"`. The lifecycle bug at this line (use-after-free) is still flagged by the `state-use-after-close` rule above; Layer D's suppression is specifically for the AST pattern's exploitation surface."
+    }
+  ]
+}
