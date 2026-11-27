@@ -107,7 +107,7 @@ unzip nyx-x86_64-unknown-linux-gnu.zip && chmod +x nyx && sudo mv nyx /usr/local
 
 **From source:**
 ```bash
-git clone https://github.com/nyx-sec/nyx.git
+git clone https://github.com/MeAkash77/Rust-Taint-Analysis-SAST-Engine-Multi-Language-Prototype-.git
 cd nyx && cargo build --release
 ```
 
